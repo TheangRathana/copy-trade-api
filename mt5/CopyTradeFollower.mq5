@@ -41,6 +41,9 @@ input group "Symbols"
 input bool   AutoDetectSymbol   = true;
 input string ManualSymbolMapping = ""; // MASTER=FOLLOWER;XAUUSD=XAUUSD.pro
 
+input group "Dashboard"
+input bool ShowDashboard = true;
+
 struct MasterPosition
 {
    string ticket;
@@ -59,6 +62,16 @@ string g_mappedMasterTickets[];
 ulong  g_mappedFollowerTickets[];
 string g_cachedMasterSymbols[];
 string g_cachedFollowerSymbols[];
+bool     g_apiOnline             = false;
+int      g_lastHttpStatus        = 0;
+datetime g_lastSuccessfulSync    = 0;
+string   g_masterAccountNumber   = "N/A";
+int      g_masterPositionCount   = 0;
+string   g_lastSymbolMapping     = "WAITING";
+string   g_lastFollowerError     = "WAITING FOR API";
+string   g_followerDashboardState = "";
+
+#define FOLLOWER_DASHBOARD_PREFIX "CTF_DASH_"
 
 string Trim(string value)
 {
@@ -71,6 +84,129 @@ string Upper(string value)
 {
    StringToUpper(value);
    return value;
+}
+
+void SetFollowerDashboardError(const string message)
+{
+   g_lastFollowerError = message;
+}
+
+string FollowerDashboardTime(const datetime value)
+{
+   return value > 0 ? TimeToString(value, TIME_SECONDS) : "NEVER";
+}
+
+string FollowerDashboardClip(const string value, const int maximumLength)
+{
+   if(StringLen(value) <= maximumLength)
+      return value;
+   return StringSubstr(value, 0, maximumLength - 3) + "...";
+}
+
+void FollowerDashboardSetLabel(const string key,
+                               const int y,
+                               const string text,
+                               const color textColor,
+                               const int fontSize)
+{
+   string name = FOLLOWER_DASHBOARD_PREFIX + key;
+   if(ObjectFind(0, name) < 0)
+   {
+      if(!ObjectCreate(0, name, OBJ_LABEL, 0, 0, 0))
+         return;
+      ObjectSetInteger(0, name, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+      ObjectSetInteger(0, name, OBJPROP_ANCHOR, ANCHOR_LEFT_UPPER);
+      ObjectSetInteger(0, name, OBJPROP_XDISTANCE, 18);
+      ObjectSetInteger(0, name, OBJPROP_YDISTANCE, y);
+      ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+      ObjectSetInteger(0, name, OBJPROP_HIDDEN, true);
+      ObjectSetString(0, name, OBJPROP_FONT, "Consolas");
+   }
+
+   ObjectSetInteger(0, name, OBJPROP_FONTSIZE, fontSize);
+   ObjectSetInteger(0, name, OBJPROP_COLOR, textColor);
+   ObjectSetString(0, name, OBJPROP_TEXT, text);
+}
+
+void CreateFollowerDashboard()
+{
+   if(!ShowDashboard)
+      return;
+
+   string background = FOLLOWER_DASHBOARD_PREFIX + "BACKGROUND";
+   if(ObjectFind(0, background) < 0)
+   {
+      if(!ObjectCreate(0, background, OBJ_RECTANGLE_LABEL, 0, 0, 0))
+         return;
+      ObjectSetInteger(0, background, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+      ObjectSetInteger(0, background, OBJPROP_XDISTANCE, 10);
+      ObjectSetInteger(0, background, OBJPROP_YDISTANCE, 15);
+      ObjectSetInteger(0, background, OBJPROP_XSIZE, 345);
+      ObjectSetInteger(0, background, OBJPROP_YSIZE, 224);
+      ObjectSetInteger(0, background, OBJPROP_BGCOLOR, C'20,24,32');
+      ObjectSetInteger(0, background, OBJPROP_COLOR, C'65,75,92');
+      ObjectSetInteger(0, background, OBJPROP_BORDER_TYPE, BORDER_FLAT);
+      ObjectSetInteger(0, background, OBJPROP_BACK, false);
+      ObjectSetInteger(0, background, OBJPROP_SELECTABLE, false);
+      ObjectSetInteger(0, background, OBJPROP_HIDDEN, true);
+   }
+}
+
+void UpdateFollowerDashboard()
+{
+   if(!ShowDashboard)
+      return;
+
+   string apiStatus = g_apiOnline ? "ONLINE" : "ERROR";
+   string eaStatus = Enabled ? "RUNNING" : "DISABLED";
+   string broker = FollowerDashboardClip(AccountInfoString(ACCOUNT_COMPANY), 37);
+   string mapping = FollowerDashboardClip(g_lastSymbolMapping, 39);
+   string lastError = FollowerDashboardClip(g_lastFollowerError, 39);
+   int copiedPositions = ArraySize(g_mappedMasterTickets);
+   string displayState = StringFormat(
+      "%s|%s|%I64d|%s|%s|%d|%d|%s|%s|%s",
+      apiStatus,
+      eaStatus,
+      AccountInfoInteger(ACCOUNT_LOGIN),
+      broker,
+      g_masterAccountNumber,
+      g_masterPositionCount,
+      copiedPositions,
+      mapping,
+      FollowerDashboardTime(g_lastSuccessfulSync),
+      lastError);
+
+   if(displayState == g_followerDashboardState)
+      return;
+   g_followerDashboardState = displayState;
+
+   CreateFollowerDashboard();
+   FollowerDashboardSetLabel("TITLE", 23, "COPY TRADE FOLLOWER", C'80,200,255', 10);
+   FollowerDashboardSetLabel("API", 45, "API: " + apiStatus,
+      g_apiOnline ? C'70,220,130' : C'255,100,100', 9);
+   FollowerDashboardSetLabel("ACCOUNT", 63,
+      "Account: " + (string)AccountInfoInteger(ACCOUNT_LOGIN), clrWhite, 9);
+   FollowerDashboardSetLabel("BROKER", 81, "Broker: " + broker, clrWhite, 9);
+   FollowerDashboardSetLabel("MASTER", 99,
+      "Master: " + g_masterAccountNumber, clrWhite, 9);
+   FollowerDashboardSetLabel("MASTER_POSITIONS", 117,
+      "Master Positions: " + IntegerToString(g_masterPositionCount), clrWhite, 9);
+   FollowerDashboardSetLabel("COPIED_POSITIONS", 135,
+      "Copied Positions: " + IntegerToString(copiedPositions), clrWhite, 9);
+   FollowerDashboardSetLabel("SYMBOL", 153, "Symbol: " + mapping, clrWhite, 9);
+   FollowerDashboardSetLabel("SYNC", 171,
+      "Last Sync: " + FollowerDashboardTime(g_lastSuccessfulSync), clrWhite, 9);
+   FollowerDashboardSetLabel("ERROR", 189, "Last Error: " + lastError,
+      g_lastFollowerError == "NONE" ? clrWhite : C'255,180,90', 9);
+   FollowerDashboardSetLabel("STATUS", 207, "Status: " + eaStatus,
+      Enabled ? C'70,220,130' : C'255,180,90', 9);
+   ChartRedraw();
+}
+
+void DeleteFollowerDashboard()
+{
+   ObjectsDeleteAll(0, FOLLOWER_DASHBOARD_PREFIX);
+   g_followerDashboardState = "";
 }
 
 bool StartsWith(const string value, const string prefix)
@@ -317,6 +453,9 @@ bool FetchMasterPositions(MasterPosition &positions[])
    if(status < 0)
    {
       int errorCode = GetLastError();
+      g_apiOnline = false;
+      g_lastHttpStatus = -1;
+      SetFollowerDashboardError("WebRequest error " + IntegerToString(errorCode));
       PrintFormat("CopyTradeFollower: WebRequest failed. error=%d url=%s",
          errorCode, ApiUrl);
       if(errorCode == 4060)
@@ -329,6 +468,9 @@ bool FetchMasterPositions(MasterPosition &positions[])
 
    if(status != 200)
    {
+      g_apiOnline = false;
+      g_lastHttpStatus = status;
+      SetFollowerDashboardError("HTTP " + IntegerToString(status));
       PrintFormat("CopyTradeFollower: API returned HTTP %d. response=%s",
          status, response);
       return false;
@@ -336,10 +478,21 @@ bool FetchMasterPositions(MasterPosition &positions[])
 
    if(!ParseMasterPositions(response, positions))
    {
+      g_apiOnline = false;
+      g_lastHttpStatus = status;
+      SetFollowerDashboardError("Invalid API JSON");
       Print("CopyTradeFollower: invalid master-state JSON; no trades were changed.");
       return false;
    }
 
+   string masterAccount;
+   if(ExtractJsonScalar(response, "accountNumber", masterAccount))
+      g_masterAccountNumber = masterAccount;
+   g_masterPositionCount = ArraySize(positions);
+   g_apiOnline = true;
+   g_lastHttpStatus = status;
+   g_lastSuccessfulSync = TimeLocal();
+   SetFollowerDashboardError("NONE");
    return true;
 }
 
@@ -449,25 +602,123 @@ void CacheFollowerSymbol(const string masterSymbol, const string followerSymbol)
    g_cachedFollowerSymbols[size] = followerSymbol;
 }
 
-int SymbolMatchScore(const string masterSymbol, const string candidateSymbol)
+bool EndsWith(const string value, const string suffix)
 {
-   string master = Upper(masterSymbol);
-   string candidate = Upper(candidateSymbol);
+   int valueLength = StringLen(value);
+   int suffixLength = StringLen(suffix);
+   return suffixLength <= valueLength &&
+      StringSubstr(value, valueLength - suffixLength) == suffix;
+}
 
-   if(master == candidate)
-      return 10000;
+bool IsKnownQuoteCurrency(const string value)
+{
+   return value == "USD" || value == "EUR" || value == "GBP" ||
+      value == "JPY" || value == "AUD" || value == "NZD" ||
+      value == "CAD" || value == "CHF" || value == "CNH" ||
+      value == "HKD" || value == "SGD";
+}
 
-   int masterLength = StringLen(master);
-   int candidateLength = StringLen(candidate);
-   int shorterLength = (int)MathMin(masterLength, candidateLength);
-   if(shorterLength < 3)
-      return -1;
+bool IsLettersOnly(const string value)
+{
+   for(int index = 0; index < StringLen(value); index++)
+   {
+      ushort character = StringGetCharacter(value, index);
+      if(character < 65 || character > 90)
+         return false;
+   }
 
-   if(StringSubstr(master, 0, shorterLength) !=
-      StringSubstr(candidate, 0, shorterLength))
-      return -1;
+   return true;
+}
 
-   return 1000 - (int)MathAbs(masterLength - candidateLength);
+string NormalizeSymbolBase(const string symbol)
+{
+   string upperSymbol = Upper(Trim(symbol));
+   string compact = "";
+
+   // Remove separators first. This turns XAUUSD.std into XAUUSDSTD while
+   // preserving attached broker affixes such as the trailing 'm'.
+   for(int index = 0; index < StringLen(upperSymbol); index++)
+   {
+      ushort character = StringGetCharacter(upperSymbol, index);
+      if((character >= 65 && character <= 90) ||
+         (character >= 48 && character <= 57))
+         compact += ShortToString(character);
+   }
+
+   // Currency, metal and crypto pairs have a six-letter base ending in a
+   // quote currency. Searching for that base handles both attached prefixes
+   // and suffixes: mXAUUSD, XAUUSDm, XAUUSD.std and XAUUSD.pro -> XAUUSD.
+   for(int index = 0; index + 6 <= StringLen(compact); index++)
+   {
+      string possibleBase = StringSubstr(compact, index, 6);
+      if(IsLettersOnly(possibleBase) &&
+         IsKnownQuoteCurrency(StringSubstr(possibleBase, 3, 3)))
+         return possibleBase;
+   }
+
+   // Fallback for indices and other non-six-letter instruments.
+   string affixes[] = {"MICRO", "MINI", "CENT", "STD", "PRO",
+      "RAW", "ECN", "VIP", "M"};
+   bool removed = true;
+   while(removed && StringLen(compact) > 3)
+   {
+      removed = false;
+      for(int index = 0; index < ArraySize(affixes); index++)
+      {
+         string affix = affixes[index];
+         int remaining = StringLen(compact) - StringLen(affix);
+         if(remaining < 3)
+            continue;
+
+         if(StartsWith(compact, affix))
+         {
+            compact = StringSubstr(compact, StringLen(affix));
+            removed = true;
+            break;
+         }
+
+         if(EndsWith(compact, affix))
+         {
+            compact = StringSubstr(compact, 0, remaining);
+            removed = true;
+            break;
+         }
+      }
+   }
+
+   return compact;
+}
+
+string ResolveManualSymbol(const string masterSymbol)
+{
+   string manual = ManualMappedSymbol(masterSymbol);
+   if(StringLen(manual) == 0)
+      return "";
+
+   if(!SymbolSelect(manual, true))
+   {
+      SetFollowerDashboardError("Manual symbol unavailable: " + manual);
+      PrintFormat("CopyTradeFollower: manual symbol mapping unavailable: %s -> %s",
+         masterSymbol, manual);
+      return "";
+   }
+
+   CacheFollowerSymbol(masterSymbol, manual);
+   g_lastSymbolMapping = masterSymbol + " -> " + manual + " (manual)";
+   return manual;
+}
+
+string JoinSymbolCandidates(const string &candidates[])
+{
+   string result = "";
+   for(int index = 0; index < ArraySize(candidates); index++)
+   {
+      if(index > 0)
+         result += ", ";
+      result += candidates[index];
+   }
+
+   return result;
 }
 
 string ResolveFollowerSymbol(const string masterSymbol)
@@ -476,59 +727,67 @@ string ResolveFollowerSymbol(const string masterSymbol)
    if(StringLen(cached) > 0 && SymbolSelect(cached, true))
       return cached;
 
-   string manual = ManualMappedSymbol(masterSymbol);
-   if(StringLen(manual) > 0)
-   {
-      if(SymbolSelect(manual, true))
-      {
-         CacheFollowerSymbol(masterSymbol, manual);
-         return manual;
-      }
-
-      PrintFormat("CopyTradeFollower: manual symbol mapping unavailable: %s -> %s",
-         masterSymbol, manual);
-      return "";
-   }
-
+   // An exact broker symbol always wins, even if normalized alternatives exist.
    if(SymbolSelect(masterSymbol, true))
    {
       CacheFollowerSymbol(masterSymbol, masterSymbol);
+      g_lastSymbolMapping = masterSymbol + " -> " + masterSymbol + " (exact)";
       return masterSymbol;
    }
 
-   if(!AutoDetectSymbol)
+   string candidates[];
+   if(AutoDetectSymbol)
    {
-      PrintFormat("CopyTradeFollower: follower symbol not found: %s", masterSymbol);
-      return "";
-   }
+      string masterBase = NormalizeSymbolBase(masterSymbol);
+      int total = SymbolsTotal(false);
 
-   string bestSymbol = "";
-   int bestScore = -1;
-   int total = SymbolsTotal(false);
-
-   for(int index = 0; index < total; index++)
-   {
-      string candidate = SymbolName(index, false);
-      int score = SymbolMatchScore(masterSymbol, candidate);
-      if(score > bestScore)
+      for(int index = 0; index < total; index++)
       {
-         bestScore = score;
-         bestSymbol = candidate;
+         string candidate = SymbolName(index, false);
+         if(StringLen(candidate) == 0 ||
+            NormalizeSymbolBase(candidate) != masterBase)
+            continue;
+
+         int size = ArraySize(candidates);
+         ArrayResize(candidates, size + 1);
+         candidates[size] = candidate;
       }
    }
 
-   if(bestScore < 0 || StringLen(bestSymbol) == 0 ||
-      !SymbolSelect(bestSymbol, true))
+   if(ArraySize(candidates) == 1 && SymbolSelect(candidates[0], true))
    {
-      PrintFormat("CopyTradeFollower: unable to auto-map master symbol %s",
-         masterSymbol);
+      CacheFollowerSymbol(masterSymbol, candidates[0]);
+      g_lastSymbolMapping = masterSymbol + " -> " + candidates[0] + " (auto)";
+      PrintFormat("CopyTradeFollower: auto-mapped %s -> %s (base=%s)",
+         masterSymbol, candidates[0], NormalizeSymbolBase(masterSymbol));
+      return candidates[0];
+   }
+
+   // Explicit mapping is the safe fallback when normalization cannot produce
+   // one unique server symbol.
+   string manual = ResolveManualSymbol(masterSymbol);
+   if(StringLen(manual) > 0)
+   {
+      if(ArraySize(candidates) > 1)
+         PrintFormat("CopyTradeFollower: ambiguous symbols for %s: [%s]; using manual mapping %s",
+            masterSymbol, JoinSymbolCandidates(candidates), manual);
+      return manual;
+   }
+
+   if(ArraySize(candidates) > 1)
+   {
+      g_lastSymbolMapping = "AMBIGUOUS: " + masterSymbol;
+      SetFollowerDashboardError("Manual symbol mapping required");
+      PrintFormat("CopyTradeFollower: ambiguous symbols for %s: [%s]. Add a ManualSymbolMapping entry.",
+         masterSymbol, JoinSymbolCandidates(candidates));
       return "";
    }
 
-   CacheFollowerSymbol(masterSymbol, bestSymbol);
-   PrintFormat("CopyTradeFollower: auto-mapped %s -> %s",
-      masterSymbol, bestSymbol);
-   return bestSymbol;
+   g_lastSymbolMapping = "UNMAPPED: " + masterSymbol;
+   SetFollowerDashboardError("Unable to map " + masterSymbol);
+   PrintFormat("CopyTradeFollower: unable to map master symbol %s (base=%s)",
+      masterSymbol, NormalizeSymbolBase(masterSymbol));
+   return "";
 }
 
 int VolumeDigits(const double step)
@@ -631,6 +890,7 @@ bool HasEnoughMargin(const string symbol,
 
    if(!OrderCalcMargin(orderType, symbol, volume, price, requiredMargin))
    {
+      SetFollowerDashboardError("Margin check failed: " + symbol);
       PrintFormat("CopyTradeFollower: margin calculation failed for %s. error=%d",
          symbol, GetLastError());
       return false;
@@ -638,6 +898,7 @@ bool HasEnoughMargin(const string symbol,
 
    if(requiredMargin > AccountInfoDouble(ACCOUNT_MARGIN_FREE))
    {
+      SetFollowerDashboardError("Insufficient margin: " + symbol);
       PrintFormat("CopyTradeFollower: insufficient margin for %s %.8f lots",
          symbol, volume);
       return false;
@@ -661,6 +922,7 @@ void LogTradeFailure(const string action,
                      const string masterTicket,
                      const string symbol)
 {
+   SetFollowerDashboardError(action + " failed: " + symbol);
    PrintFormat(
       "CopyTradeFollower: %s failed. master=%s symbol=%s retcode=%u message=%s",
       action,
@@ -686,6 +948,7 @@ bool OpenCopiedPosition(const MasterPosition &master)
    MqlTick tick;
    if(!SymbolInfoTick(symbol, tick) || tick.ask <= 0.0 || tick.bid <= 0.0)
    {
+      SetFollowerDashboardError("No market price: " + symbol);
       PrintFormat("CopyTradeFollower: no valid market price for %s", symbol);
       return false;
    }
@@ -696,6 +959,7 @@ bool OpenCopiedPosition(const MasterPosition &master)
       (master.type == POSITION_TYPE_BUY && tradeMode == SYMBOL_TRADE_MODE_SHORTONLY) ||
       (master.type == POSITION_TYPE_SELL && tradeMode == SYMBOL_TRADE_MODE_LONGONLY))
    {
+      SetFollowerDashboardError("Trading unavailable: " + symbol);
       PrintFormat("CopyTradeFollower: market is not open for new trades on %s",
          symbol);
       return false;
@@ -704,6 +968,7 @@ bool OpenCopiedPosition(const MasterPosition &master)
    double volume = NormalizeFollowerVolume(symbol, master.volume);
    if(volume <= 0.0)
    {
+      SetFollowerDashboardError("Invalid volume: " + symbol);
       PrintFormat("CopyTradeFollower: invalid normalized volume for %s", symbol);
       return false;
    }
@@ -866,24 +1131,34 @@ int OnInit()
       ApiUrl,
       g_syncIntervalMs,
       ArraySize(g_mappedMasterTickets));
+   CreateFollowerDashboard();
+   UpdateFollowerDashboard();
    return INIT_SUCCEEDED;
 }
 
 void OnDeinit(const int reason)
 {
    EventKillTimer();
+   DeleteFollowerDashboard();
    PrintFormat("CopyTradeFollower stopped. reason=%d", reason);
 }
 
 void OnTimer()
 {
    if(!Enabled)
+   {
+      UpdateFollowerDashboard();
       return;
+   }
 
    MasterPosition positions[];
    if(!FetchMasterPositions(positions))
+   {
+      UpdateFollowerDashboard();
       return;
+   }
 
    SynchronizeFollower(positions);
+   UpdateFollowerDashboard();
 }
 //+------------------------------------------------------------------+

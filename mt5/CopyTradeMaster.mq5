@@ -12,10 +12,19 @@ input string ApiUrl                   = "http://127.0.0.1:4000/api/master/state"
 input int    SyncIntervalMs           = 250;
 input int    HeartbeatIntervalSeconds = 5;
 
+input group "Dashboard"
+input bool ShowDashboard = true;
+
 string g_lastSuccessfulSnapshot = "";
 uint   g_lastSuccessfulSendMs   = 0;
 int    g_syncIntervalMs         = 250;
 uint   g_heartbeatIntervalMs    = 5000;
+bool     g_apiOnline            = false;
+int      g_lastHttpStatus       = 0;
+datetime g_lastSuccessfulSync   = 0;
+string   g_masterDashboardState = "";
+
+#define MASTER_DASHBOARD_PREFIX "CTM_DASH_"
 
 string JsonEscape(string value)
 {
@@ -69,6 +78,115 @@ int SymbolPriceDigits(const string symbol)
       return 8;
 
    return (int)digits;
+}
+
+string MasterDashboardTime(const datetime value)
+{
+   return value > 0 ? TimeToString(value, TIME_SECONDS) : "NEVER";
+}
+
+string MasterDashboardClip(const string value, const int maximumLength)
+{
+   if(StringLen(value) <= maximumLength)
+      return value;
+   return StringSubstr(value, 0, maximumLength - 3) + "...";
+}
+
+void MasterDashboardSetLabel(const string key,
+                             const int y,
+                             const string text,
+                             const color textColor,
+                             const int fontSize)
+{
+   string name = MASTER_DASHBOARD_PREFIX + key;
+   if(ObjectFind(0, name) < 0)
+   {
+      if(!ObjectCreate(0, name, OBJ_LABEL, 0, 0, 0))
+         return;
+      ObjectSetInteger(0, name, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+      ObjectSetInteger(0, name, OBJPROP_ANCHOR, ANCHOR_LEFT_UPPER);
+      ObjectSetInteger(0, name, OBJPROP_XDISTANCE, 18);
+      ObjectSetInteger(0, name, OBJPROP_YDISTANCE, y);
+      ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+      ObjectSetInteger(0, name, OBJPROP_HIDDEN, true);
+      ObjectSetString(0, name, OBJPROP_FONT, "Consolas");
+   }
+
+   ObjectSetInteger(0, name, OBJPROP_FONTSIZE, fontSize);
+   ObjectSetInteger(0, name, OBJPROP_COLOR, textColor);
+   ObjectSetString(0, name, OBJPROP_TEXT, text);
+}
+
+void CreateMasterDashboard()
+{
+   if(!ShowDashboard)
+      return;
+
+   string background = MASTER_DASHBOARD_PREFIX + "BACKGROUND";
+   if(ObjectFind(0, background) < 0)
+   {
+      if(!ObjectCreate(0, background, OBJ_RECTANGLE_LABEL, 0, 0, 0))
+         return;
+      ObjectSetInteger(0, background, OBJPROP_CORNER, CORNER_LEFT_UPPER);
+      ObjectSetInteger(0, background, OBJPROP_XDISTANCE, 10);
+      ObjectSetInteger(0, background, OBJPROP_YDISTANCE, 15);
+      ObjectSetInteger(0, background, OBJPROP_XSIZE, 315);
+      ObjectSetInteger(0, background, OBJPROP_YSIZE, 188);
+      ObjectSetInteger(0, background, OBJPROP_BGCOLOR, C'20,24,32');
+      ObjectSetInteger(0, background, OBJPROP_COLOR, C'65,75,92');
+      ObjectSetInteger(0, background, OBJPROP_BORDER_TYPE, BORDER_FLAT);
+      ObjectSetInteger(0, background, OBJPROP_BACK, false);
+      ObjectSetInteger(0, background, OBJPROP_SELECTABLE, false);
+      ObjectSetInteger(0, background, OBJPROP_HIDDEN, true);
+   }
+}
+
+void UpdateMasterDashboard()
+{
+   if(!ShowDashboard)
+      return;
+
+   string apiStatus = g_apiOnline ? "ONLINE" : "ERROR";
+   string httpStatus = g_lastHttpStatus == 0
+      ? "N/A"
+      : IntegerToString(g_lastHttpStatus);
+   string broker = MasterDashboardClip(AccountInfoString(ACCOUNT_COMPANY), 35);
+   string server = MasterDashboardClip(AccountInfoString(ACCOUNT_SERVER), 35);
+   string displayState = StringFormat(
+      "%s|%I64d|%s|%s|%d|%s|%s",
+      apiStatus,
+      AccountInfoInteger(ACCOUNT_LOGIN),
+      broker,
+      server,
+      PositionsTotal(),
+      MasterDashboardTime(g_lastSuccessfulSync),
+      httpStatus);
+
+   if(displayState == g_masterDashboardState)
+      return;
+   g_masterDashboardState = displayState;
+
+   CreateMasterDashboard();
+   MasterDashboardSetLabel("TITLE", 23, "COPY TRADE MASTER", C'80,200,255', 10);
+   MasterDashboardSetLabel("API", 45, "API: " + apiStatus,
+      g_apiOnline ? C'70,220,130' : C'255,100,100', 9);
+   MasterDashboardSetLabel("ACCOUNT", 63,
+      "Account: " + (string)AccountInfoInteger(ACCOUNT_LOGIN), clrWhite, 9);
+   MasterDashboardSetLabel("BROKER", 81, "Broker: " + broker, clrWhite, 9);
+   MasterDashboardSetLabel("SERVER", 99, "Server: " + server, clrWhite, 9);
+   MasterDashboardSetLabel("POSITIONS", 117,
+      "Positions: " + IntegerToString(PositionsTotal()), clrWhite, 9);
+   MasterDashboardSetLabel("SYNC", 135,
+      "Last Sync: " + MasterDashboardTime(g_lastSuccessfulSync), clrWhite, 9);
+   MasterDashboardSetLabel("HTTP", 153, "HTTP: " + httpStatus, clrWhite, 9);
+   MasterDashboardSetLabel("STATUS", 171, "Status: RUNNING", C'70,220,130', 9);
+   ChartRedraw();
+}
+
+void DeleteMasterDashboard()
+{
+   ObjectsDeleteAll(0, MASTER_DASHBOARD_PREFIX);
+   g_masterDashboardState = "";
 }
 
 string BuildMasterStateJson(string &snapshotForComparison)
@@ -164,6 +282,8 @@ bool SendMasterState(const string json)
    if(status < 0)
    {
       int errorCode = GetLastError();
+      g_apiOnline = false;
+      g_lastHttpStatus = -1;
       PrintFormat(
          "CopyTradeMaster: WebRequest failed. error=%d url=%s",
          errorCode,
@@ -182,6 +302,8 @@ bool SendMasterState(const string json)
 
    if(status < 200 || status >= 300)
    {
+      g_apiOnline = false;
+      g_lastHttpStatus = status;
       string response =
          CharArrayToString(responseBody, 0, WHOLE_ARRAY, CP_UTF8);
       PrintFormat(
@@ -191,6 +313,9 @@ bool SendMasterState(const string json)
       return false;
    }
 
+   g_apiOnline = true;
+   g_lastHttpStatus = status;
+   g_lastSuccessfulSync = TimeLocal();
    return true;
 }
 
@@ -242,17 +367,22 @@ int OnInit()
       g_syncIntervalMs,
       HeartbeatIntervalSeconds > 0 ? HeartbeatIntervalSeconds : 5);
 
+   CreateMasterDashboard();
+   UpdateMasterDashboard();
+
    return INIT_SUCCEEDED;
 }
 
 void OnDeinit(const int reason)
 {
    EventKillTimer();
+   DeleteMasterDashboard();
    PrintFormat("CopyTradeMaster stopped. reason=%d", reason);
 }
 
 void OnTimer()
 {
    PublishMasterStateIfNeeded();
+   UpdateMasterDashboard();
 }
 //+------------------------------------------------------------------+
