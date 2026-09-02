@@ -1,0 +1,1 @@
+{"version":3,"file":"master-state.store.d.ts","sourceRoot":"","sources":["../../src/stores/master-state.store.ts"],"names":[],"mappings":"AAAA,OAAO,KAAK,EAAE,WAAW,EAAE,MAAM,mCAAmC,CAAC;AAErE,qBAAa,gBAAgB;IAC3B,OAAO,CAAC,WAAW,CAA4B;IAE/C,GAAG,CAAC,KAAK,EAAE,WAAW,GAAG,WAAW,CAGnC;IAED,GAAG,IAAI,WAAW,GAAG,IAAI,CAExB;CACF"}
