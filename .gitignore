@@ -1,0 +1,32 @@
+# Dependencies
+node_modules/
+
+# TypeScript build output and caches
+dist/
+*.tsbuildinfo
+
+# Test coverage
+coverage/
+
+# Environment files (keep an example file trackable)
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+pnpm-debug.log*
+
+# MT5 compiled artifacts
+*.ex5
+
+# Editor and operating-system files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Temporary files
+tmp/
+temp/
+*.tmp
