@@ -29,7 +29,7 @@ input bool  CopySell      = true;
 input bool  CopyStopLoss  = true;
 input bool  CopyTakeProfit = true;
 input bool  CopyModify    = true;
-input bool  CopyClose     = true;
+input bool  CopyClosedPositions = true;
 
 input group "Volume"
 input ENUM_COPY_LOT_MODE LotMode      = SAME_AS_MASTER;
@@ -791,7 +791,7 @@ void ModifyCopiedPosition(const MasterPosition &master,
 
 void CloseMissingCopiedPositions(const MasterPosition &masterPositions[])
 {
-   if(!CopyClose)
+   if(!CopyClosedPositions)
       return;
 
    for(int index = ArraySize(g_mappedFollowerTickets) - 1; index >= 0; index--)
