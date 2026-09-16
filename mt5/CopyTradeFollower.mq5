@@ -8,7 +8,7 @@
 
 #include <Trade\Trade.mqh>
 
-#define COPY_COMMENT_PREFIX "COPY_MASTER_"
+#define COPY_COMMENT_PREFIX "Copy AiO_"
 
 enum ENUM_COPY_LOT_MODE
 {

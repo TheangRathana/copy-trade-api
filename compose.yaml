@@ -1,0 +1,16 @@
+services:
+  api-4001:
+    build: .
+    image: copy-trade-api:local
+    init: true
+    restart: unless-stopped
+    ports:
+      - "4001:4000"
+
+  api-4002:
+    build: .
+    image: copy-trade-api:local
+    init: true
+    restart: unless-stopped
+    ports:
+      - "4002:4000"
