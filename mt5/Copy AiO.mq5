@@ -9,12 +9,14 @@
 #include <Trade\Trade.mqh>
 
 #define COPY_COMMENT_PREFIX "Copy AiO_"
+#define LEGACY_COPY_COMMENT_PREFIX "COPY_MASTER_"
 
 enum ENUM_COPY_LOT_MODE
 {
    SAME_AS_MASTER = 0,
    FIXED          = 1,
-   MULTIPLIER     = 2
+   MULTIPLIER     = 2,
+   STEP_LOT       = 3
 };
 
 input group "Connection"
@@ -36,6 +38,10 @@ input ENUM_COPY_LOT_MODE LotMode      = SAME_AS_MASTER;
 input double             FixedLot     = 0.01;
 input double             LotMultiplier = 1.0;
 input double             MaxLot       = 10.0;
+input double             StepStartMultiplier = 1.0;
+input double             StepMultiplier      = 0.5;
+input double             StepMinMultiplier   = 0.1;
+input double             StepMaxMultiplier   = 10.0;
 
 input group "Symbols"
 input bool   AutoDetectSymbol   = true;
@@ -498,10 +504,14 @@ bool FetchMasterPositions(MasterPosition &positions[])
 
 string MasterTicketFromComment(const string comment)
 {
-   if(!StartsWith(comment, COPY_COMMENT_PREFIX))
-      return "";
+   if(StartsWith(comment, COPY_COMMENT_PREFIX))
+      return Trim(StringSubstr(comment, StringLen(COPY_COMMENT_PREFIX)));
 
-   return Trim(StringSubstr(comment, StringLen(COPY_COMMENT_PREFIX)));
+   // Keep tracking positions opened before the trade label was renamed.
+   if(StartsWith(comment, LEGACY_COPY_COMMENT_PREFIX))
+      return Trim(StringSubstr(comment, StringLen(LEGACY_COPY_COMMENT_PREFIX)));
+
+   return "";
 }
 
 bool IsOwnedPosition(const ulong positionTicket, string &masterTicket)
@@ -801,13 +811,24 @@ int VolumeDigits(const double step)
    return 8;
 }
 
-double NormalizeFollowerVolume(const string symbol, const double masterVolume)
+double StepLotMultiplier(const int sequenceNumber)
+{
+   double multiplier = StepStartMultiplier +
+      (sequenceNumber - 1) * StepMultiplier;
+   return MathMax(StepMinMultiplier, MathMin(multiplier, StepMaxMultiplier));
+}
+
+double NormalizeFollowerVolume(const string symbol,
+                               const double masterVolume,
+                               const int sequenceNumber)
 {
    double requested = masterVolume;
    if(LotMode == FIXED)
       requested = FixedLot;
    else if(LotMode == MULTIPLIER)
       requested = masterVolume * LotMultiplier;
+   else if(LotMode == STEP_LOT)
+      requested = masterVolume * StepLotMultiplier(sequenceNumber);
 
    double minimum = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MIN);
    double maximum = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MAX);
@@ -932,7 +953,8 @@ void LogTradeFailure(const string action,
       g_trade.ResultRetcodeDescription());
 }
 
-bool OpenCopiedPosition(const MasterPosition &master)
+bool OpenCopiedPosition(const MasterPosition &master,
+                        const int sequenceNumber)
 {
    if((master.type == POSITION_TYPE_BUY && !CopyBuy) ||
       (master.type == POSITION_TYPE_SELL && !CopySell))
@@ -965,7 +987,7 @@ bool OpenCopiedPosition(const MasterPosition &master)
       return false;
    }
 
-   double volume = NormalizeFollowerVolume(symbol, master.volume);
+   double volume = NormalizeFollowerVolume(symbol, master.volume, sequenceNumber);
    if(volume <= 0.0)
    {
       SetFollowerDashboardError("Invalid volume: " + symbol);
@@ -992,6 +1014,11 @@ bool OpenCopiedPosition(const MasterPosition &master)
       LogTradeFailure("open", master.ticket, symbol);
       return false;
    }
+
+   if(LotMode == STEP_LOT)
+      PrintFormat("Copy AiO: step lot master=%s sequence=%d masterLot=%.8f multiplier=%.8f followerLot=%.8f",
+         master.ticket, sequenceNumber, master.volume,
+         StepLotMultiplier(sequenceNumber), volume);
 
    RebuildMasterTicketMapping();
    return true;
@@ -1090,7 +1117,9 @@ void SynchronizeFollower(const MasterPosition &masterPositions[])
       ulong followerTicket = FindFollowerTicket(masterPositions[index].ticket);
       if(followerTicket == 0)
       {
-         OpenCopiedPosition(masterPositions[index]);
+         // The Master publishes active positions in ascending ticket order.
+         // Include every Master position, even if an earlier copy failed.
+         OpenCopiedPosition(masterPositions[index], index + 1);
          followerTicket = FindFollowerTicket(masterPositions[index].ticket);
       }
 
@@ -1110,6 +1139,16 @@ int OnInit()
    if(MagicNumber == 0)
    {
       Print("CopyTradeFollower: MagicNumber must be greater than zero.");
+      return INIT_PARAMETERS_INCORRECT;
+   }
+
+   if(!MathIsValidNumber(StepStartMultiplier) || StepStartMultiplier <= 0.0 ||
+      !MathIsValidNumber(StepMultiplier) ||
+      !MathIsValidNumber(StepMinMultiplier) || StepMinMultiplier <= 0.0 ||
+      !MathIsValidNumber(StepMaxMultiplier) || StepMaxMultiplier <= 0.0 ||
+      StepMinMultiplier > StepMaxMultiplier)
+   {
+      Print("Copy AiO: invalid step lot settings. Start, min, and max must be positive; min must not exceed max; all values must be finite.");
       return INIT_PARAMETERS_INCORRECT;
    }
 
