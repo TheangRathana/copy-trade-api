@@ -1,15 +1,17 @@
 //+------------------------------------------------------------------+
 //|                                            CopyTradeFollower.mq5 |
-//| Copies the current Master snapshot from the local Fastify API.   |
+//| Syncs with the local Fastify API: copies the Master snapshot,    |
+//| applies settings and runs commands sent from the web dashboard.  |
 //+------------------------------------------------------------------+
 #property strict
-#property version   "1.00"
+#property version   "2.00"
 #property description "Copy-trade Follower EA"
 
 #include <Trade\Trade.mqh>
 
 #define COPY_COMMENT_PREFIX "Copy AiO_"
 #define LEGACY_COPY_COMMENT_PREFIX "COPY_MASTER_"
+#define MAX_REMEMBERED_COMMANDS 100
 
 enum ENUM_COPY_LOT_MODE
 {
@@ -19,33 +21,14 @@ enum ENUM_COPY_LOT_MODE
    STEP_LOT       = 3
 };
 
+// Copy and risk settings now come from the API (edited in the web dashboard).
 input group "Connection"
-input string ApiUrl        = "http://127.0.0.1:4000/api/master/state";
+input string ApiBaseUrl     = "http://127.0.0.1:4000";
 input int    SyncIntervalMs = 250;
-input bool   Enabled        = true;
+input bool   Enabled        = true; // false = never trade from this terminal
 
-input group "Copy Settings"
-input ulong MagicNumber   = 26090201;
-input bool  CopyBuy       = true;
-input bool  CopySell      = true;
-input bool  CopyStopLoss  = true;
-input bool  CopyTakeProfit = true;
-input bool  CopyModify    = true;
-input bool  CopyClosedPositions = true;
-
-input group "Volume"
-input ENUM_COPY_LOT_MODE LotMode      = SAME_AS_MASTER;
-input double             FixedLot     = 0.01;
-input double             LotMultiplier = 1.0;
-input double             MaxLot       = 10.0;
-input double             StepStartMultiplier = 1.0;
-input double             StepMultiplier      = 0.5;
-input double             StepMinMultiplier   = 0.1;
-input double             StepMaxMultiplier   = 10.0;
-
-input group "Symbols"
-input bool   AutoDetectSymbol   = true;
-input string ManualSymbolMapping = ""; // MASTER=FOLLOWER;XAUUSD=XAUUSD.pro
+input group "Copy"
+input ulong MagicNumber = 26090201;
 
 input group "Dashboard"
 input bool ShowDashboard = true;
@@ -61,8 +44,31 @@ struct MasterPosition
    double takeProfit;
 };
 
+struct CopySettings
+{
+   bool               copyBuy;
+   bool               copySell;
+   bool               copyStopLoss;
+   bool               copyTakeProfit;
+   bool               copyModify;
+   bool               copyClosedPositions;
+   ENUM_COPY_LOT_MODE lotMode;
+   double             fixedLot;
+   double             lotMultiplier;
+   double             maxLot;
+   double             stepStartMultiplier;
+   double             stepMultiplier;
+   double             stepMinMultiplier;
+   double             stepMaxMultiplier;
+   bool               autoDetectSymbol;
+   int                maxOpenPositions;
+   double             maxDailyLossPercent;
+   bool               closeAllOnDailyLoss;
+};
+
 CTrade g_trade;
 int    g_syncIntervalMs = 250;
+string g_apiBaseUrl     = "";
 
 string g_mappedMasterTickets[];
 ulong  g_mappedFollowerTickets[];
@@ -77,6 +83,27 @@ string   g_lastSymbolMapping     = "WAITING";
 string   g_lastFollowerError     = "WAITING FOR API";
 string   g_followerDashboardState = "";
 
+// State received from the API.
+CopySettings g_settings;
+string   g_symbolMapMaster[];
+string   g_symbolMapFollower[];
+bool     g_haveSettings      = false;
+long     g_settingsVersion   = 0;
+bool     g_copyEnabled       = false;
+string   g_stopReason        = "";
+bool     g_masterOnline      = false;
+bool     g_haveMasterState   = false;
+string   g_pairingCode       = "";
+datetime g_pairingExpiresAt  = 0;
+
+// Set when this EA stops copying by itself; sent to the API until it records it.
+string   g_autoStopReason    = "";
+
+// Results of commands already run, so a repeated command is acked, not re-run.
+string g_doneCommandIds[];
+string g_doneCommandStatuses[];
+string g_doneCommandErrors[];
+
 #define FOLLOWER_DASHBOARD_PREFIX "CTF_DASH_"
 
 string Trim(string value)
@@ -90,6 +117,11 @@ string Upper(string value)
 {
    StringToUpper(value);
    return value;
+}
+
+string AccountLogin()
+{
+   return (string)AccountInfoInteger(ACCOUNT_LOGIN);
 }
 
 void SetFollowerDashboardError(const string message)
@@ -147,8 +179,8 @@ void CreateFollowerDashboard()
       ObjectSetInteger(0, background, OBJPROP_CORNER, CORNER_LEFT_UPPER);
       ObjectSetInteger(0, background, OBJPROP_XDISTANCE, 10);
       ObjectSetInteger(0, background, OBJPROP_YDISTANCE, 15);
-      ObjectSetInteger(0, background, OBJPROP_XSIZE, 345);
-      ObjectSetInteger(0, background, OBJPROP_YSIZE, 224);
+      ObjectSetInteger(0, background, OBJPROP_XSIZE, 360);
+      ObjectSetInteger(0, background, OBJPROP_YSIZE, 262);
       ObjectSetInteger(0, background, OBJPROP_BGCOLOR, C'20,24,32');
       ObjectSetInteger(0, background, OBJPROP_COLOR, C'65,75,92');
       ObjectSetInteger(0, background, OBJPROP_BORDER_TYPE, BORDER_FLAT);
@@ -158,26 +190,66 @@ void CreateFollowerDashboard()
    }
 }
 
+bool IsCopying()
+{
+   return Enabled && g_haveSettings && g_copyEnabled &&
+      StringLen(g_autoStopReason) == 0;
+}
+
+string CopyStatusText()
+{
+   if(!Enabled)
+      return "DISABLED ON TERMINAL";
+   if(!g_haveSettings)
+      return "WAITING FOR SETTINGS";
+   if(IsCopying())
+      return "ON";
+
+   string reason = StringLen(g_autoStopReason) > 0 ? g_autoStopReason : g_stopReason;
+   return StringLen(reason) > 0 ? "OFF (" + reason + ")" : "OFF";
+}
+
+string PairingText()
+{
+   if(StringLen(g_pairingCode) == 0)
+      return "WAITING";
+
+   long secondsLeft = (long)(g_pairingExpiresAt - TimeGMT());
+   if(secondsLeft <= 0)
+      return "REFRESHING...";
+
+   return StringFormat("%s  (%d:%02d)", g_pairingCode,
+      (int)(secondsLeft / 60), (int)(secondsLeft % 60));
+}
+
 void UpdateFollowerDashboard()
 {
    if(!ShowDashboard)
       return;
 
    string apiStatus = g_apiOnline ? "ONLINE" : "ERROR";
-   string eaStatus = Enabled ? "RUNNING" : "DISABLED";
    string broker = FollowerDashboardClip(AccountInfoString(ACCOUNT_COMPANY), 37);
+   string master = g_masterAccountNumber +
+      (g_masterOnline ? " (online)" : " (offline)");
+   string copyStatus = FollowerDashboardClip(CopyStatusText(), 38);
+   string settingsText = g_haveSettings
+      ? "v" + IntegerToString(g_settingsVersion)
+      : "WAITING";
+   string pairing = PairingText();
    string mapping = FollowerDashboardClip(g_lastSymbolMapping, 39);
    string lastError = FollowerDashboardClip(g_lastFollowerError, 39);
    int copiedPositions = ArraySize(g_mappedMasterTickets);
    string displayState = StringFormat(
-      "%s|%s|%I64d|%s|%s|%d|%d|%s|%s|%s",
+      "%s|%s|%s|%s|%d|%d|%s|%s|%s|%s|%s|%s",
       apiStatus,
-      eaStatus,
-      AccountInfoInteger(ACCOUNT_LOGIN),
+      AccountLogin(),
       broker,
-      g_masterAccountNumber,
+      master,
       g_masterPositionCount,
       copiedPositions,
+      copyStatus,
+      settingsText,
+      pairing,
       mapping,
       FollowerDashboardTime(g_lastSuccessfulSync),
       lastError);
@@ -190,22 +262,25 @@ void UpdateFollowerDashboard()
    FollowerDashboardSetLabel("TITLE", 23, "COPY TRADE FOLLOWER", C'80,200,255', 10);
    FollowerDashboardSetLabel("API", 45, "API: " + apiStatus,
       g_apiOnline ? C'70,220,130' : C'255,100,100', 9);
-   FollowerDashboardSetLabel("ACCOUNT", 63,
-      "Account: " + (string)AccountInfoInteger(ACCOUNT_LOGIN), clrWhite, 9);
+   FollowerDashboardSetLabel("ACCOUNT", 63, "Account: " + AccountLogin(), clrWhite, 9);
    FollowerDashboardSetLabel("BROKER", 81, "Broker: " + broker, clrWhite, 9);
-   FollowerDashboardSetLabel("MASTER", 99,
-      "Master: " + g_masterAccountNumber, clrWhite, 9);
+   FollowerDashboardSetLabel("MASTER", 99, "Master: " + master,
+      g_masterOnline ? clrWhite : C'255,180,90', 9);
    FollowerDashboardSetLabel("MASTER_POSITIONS", 117,
       "Master Positions: " + IntegerToString(g_masterPositionCount), clrWhite, 9);
    FollowerDashboardSetLabel("COPIED_POSITIONS", 135,
       "Copied Positions: " + IntegerToString(copiedPositions), clrWhite, 9);
-   FollowerDashboardSetLabel("SYMBOL", 153, "Symbol: " + mapping, clrWhite, 9);
-   FollowerDashboardSetLabel("SYNC", 171,
+   FollowerDashboardSetLabel("COPY", 153, "Copy: " + copyStatus,
+      IsCopying() ? C'70,220,130' : C'255,180,90', 9);
+   FollowerDashboardSetLabel("SETTINGS", 171, "Settings: " + settingsText,
+      clrWhite, 9);
+   FollowerDashboardSetLabel("PAIRING", 189, "Dashboard Code: " + pairing,
+      C'80,200,255', 10);
+   FollowerDashboardSetLabel("SYMBOL", 209, "Symbol: " + mapping, clrWhite, 9);
+   FollowerDashboardSetLabel("SYNC", 227,
       "Last Sync: " + FollowerDashboardTime(g_lastSuccessfulSync), clrWhite, 9);
-   FollowerDashboardSetLabel("ERROR", 189, "Last Error: " + lastError,
+   FollowerDashboardSetLabel("ERROR", 245, "Last Error: " + lastError,
       g_lastFollowerError == "NONE" ? clrWhite : C'255,180,90', 9);
-   FollowerDashboardSetLabel("STATUS", 207, "Status: " + eaStatus,
-      Enabled ? C'70,220,130' : C'255,180,90', 9);
    ChartRedraw();
 }
 
@@ -220,6 +295,8 @@ bool StartsWith(const string value, const string prefix)
    return StringLen(value) >= StringLen(prefix) &&
       StringSubstr(value, 0, StringLen(prefix)) == prefix;
 }
+
+//--- JSON reading -------------------------------------------------------
 
 int FindMatchingJsonToken(const string json,
                           const int start,
@@ -264,27 +341,73 @@ int FindMatchingJsonToken(const string json,
    return -1;
 }
 
-int FindJsonValueStart(const string json, const string key)
+// Returns the index of the closing quote of the string starting at start.
+int SkipJsonString(const string json, const int start)
 {
-   string quotedKey = "\"" + key + "\"";
-   int keyPosition = StringFind(json, quotedKey);
-   if(keyPosition < 0)
-      return -1;
+   bool escaped = false;
 
-   int colonPosition = StringFind(json, ":", keyPosition + StringLen(quotedKey));
-   if(colonPosition < 0)
-      return -1;
-
-   int valuePosition = colonPosition + 1;
-   while(valuePosition < StringLen(json))
+   for(int index = start + 1; index < StringLen(json); index++)
    {
-      ushort character = StringGetCharacter(json, valuePosition);
-      if(character != 32 && character != 9 && character != 10 && character != 13)
-         break;
-      valuePosition++;
+      ushort character = StringGetCharacter(json, index);
+      if(escaped)
+         escaped = false;
+      else if(character == 92)
+         escaped = true;
+      else if(character == 34)
+         return index;
    }
 
-   return valuePosition;
+   return -1;
+}
+
+int SkipJsonWhitespace(const string json, int index)
+{
+   while(index < StringLen(json))
+   {
+      ushort character = StringGetCharacter(json, index);
+      if(character != 32 && character != 9 && character != 10 && character != 13)
+         break;
+      index++;
+   }
+
+   return index;
+}
+
+// Only matches keys of the outermost object, so a nested object with the same
+// key name (for example "master" inside symbolMappings) is never picked up.
+int FindJsonValueStart(const string json, const string key)
+{
+   int depth = 0;
+   int length = StringLen(json);
+
+   for(int index = 0; index < length; index++)
+   {
+      ushort character = StringGetCharacter(json, index);
+
+      if(character == 34)
+      {
+         int end = SkipJsonString(json, index);
+         if(end < 0)
+            return -1;
+
+         if(depth == 1 && StringSubstr(json, index + 1, end - index - 1) == key)
+         {
+            int colon = SkipJsonWhitespace(json, end + 1);
+            if(colon < length && StringGetCharacter(json, colon) == 58)
+               return SkipJsonWhitespace(json, colon + 1);
+         }
+
+         index = end;
+         continue;
+      }
+
+      if(character == 123 || character == 91)
+         depth++;
+      else if(character == 125 || character == 93)
+         depth--;
+   }
+
+   return -1;
 }
 
 bool ReadJsonString(const string json, const int start, string &value)
@@ -349,7 +472,7 @@ bool ExtractJsonScalar(const string json, const string key, string &value)
    while(end < StringLen(json))
    {
       ushort character = StringGetCharacter(json, end);
-      if(character == 44 || character == 125 ||
+      if(character == 44 || character == 125 || character == 93 ||
          character == 32 || character == 9 ||
          character == 10 || character == 13)
          break;
@@ -373,45 +496,269 @@ bool ExtractJsonNumber(const string json, const string key, double &value)
    return true;
 }
 
-bool ParseMasterPositions(const string json, MasterPosition &positions[])
+bool ExtractJsonBool(const string json, const string key, bool &value)
 {
-   ArrayResize(positions, 0);
-
-   int positionsKey = StringFind(json, "\"positions\"");
-   if(positionsKey < 0)
+   string raw;
+   if(!ExtractJsonScalar(json, key, raw))
       return false;
 
-   int arrayStart = StringFind(json, "[", positionsKey);
-   if(arrayStart < 0)
+   if(raw == "true")
+      value = true;
+   else if(raw == "false")
+      value = false;
+   else
       return false;
 
-   int arrayEnd = FindMatchingJsonToken(json, arrayStart, 91, 93);
-   if(arrayEnd < 0)
+   return true;
+}
+
+// A JSON null becomes an empty string.
+bool ExtractJsonNullableString(const string json, const string key, string &value)
+{
+   int start = FindJsonValueStart(json, key);
+   if(start < 0)
       return false;
 
-   int cursor = arrayStart + 1;
+   if(StringSubstr(json, start, 4) == "null")
+   {
+      value = "";
+      return true;
+   }
+
+   return ReadJsonString(json, start, value);
+}
+
+bool ExtractJsonContainer(const string json,
+                          const string key,
+                          const ushort openToken,
+                          const ushort closeToken,
+                          string &value)
+{
+   int start = FindJsonValueStart(json, key);
+   if(start < 0 || StringGetCharacter(json, start) != openToken)
+      return false;
+
+   int end = FindMatchingJsonToken(json, start, openToken, closeToken);
+   if(end < 0)
+      return false;
+
+   value = StringSubstr(json, start, end - start + 1);
+   return true;
+}
+
+bool ExtractJsonObject(const string json, const string key, string &value)
+{
+   return ExtractJsonContainer(json, key, 123, 125, value);
+}
+
+bool ExtractJsonArray(const string json, const string key, string &value)
+{
+   return ExtractJsonContainer(json, key, 91, 93, value);
+}
+
+// Splits a JSON array of objects. Returns the count, or -1 if malformed.
+int SplitJsonObjects(const string arrayJson, string &objects[])
+{
+   ArrayResize(objects, 0);
+
+   int arrayEnd = FindMatchingJsonToken(arrayJson, 0, 91, 93);
+   if(StringGetCharacter(arrayJson, 0) != 91 || arrayEnd < 0)
+      return -1;
+
+   int cursor = 1;
    while(cursor < arrayEnd)
    {
-      int objectStart = StringFind(json, "{", cursor);
+      int objectStart = StringFind(arrayJson, "{", cursor);
       if(objectStart < 0 || objectStart >= arrayEnd)
          break;
 
-      int objectEnd = FindMatchingJsonToken(json, objectStart, 123, 125);
+      int objectEnd = FindMatchingJsonToken(arrayJson, objectStart, 123, 125);
       if(objectEnd < 0 || objectEnd > arrayEnd)
-         return false;
+         return -1;
 
-      string objectJson =
-         StringSubstr(json, objectStart, objectEnd - objectStart + 1);
+      int size = ArraySize(objects);
+      ArrayResize(objects, size + 1);
+      objects[size] = StringSubstr(arrayJson, objectStart, objectEnd - objectStart + 1);
+      cursor = objectEnd + 1;
+   }
+
+   return ArraySize(objects);
+}
+
+//--- JSON writing -------------------------------------------------------
+
+string JsonString(const string value)
+{
+   string result = "\"";
+
+   for(int index = 0; index < StringLen(value); index++)
+   {
+      ushort character = StringGetCharacter(value, index);
+      if(character == 34)
+         result += "\\\"";
+      else if(character == 92)
+         result += "\\\\";
+      else if(character < 32)
+         result += StringFormat("\\u%04X", character);
+      else
+         result += ShortToString(character);
+   }
+
+   return result + "\"";
+}
+
+string JsonNullableString(const string value)
+{
+   return StringLen(value) > 0 ? JsonString(value) : "null";
+}
+
+string IsoUtc(const datetime value)
+{
+   MqlDateTime parts;
+   TimeToStruct(value, parts);
+   return StringFormat("%04d-%02d-%02dT%02d:%02d:%02dZ",
+      parts.year, parts.mon, parts.day, parts.hour, parts.min, parts.sec);
+}
+
+// "2026-10-16T12:05:00.000Z" -> datetime (UTC).
+datetime ParseIsoUtc(const string iso)
+{
+   if(StringLen(iso) < 19)
+      return 0;
+
+   string value = StringSubstr(iso, 0, 19);
+   StringReplace(value, "-", ".");
+   StringReplace(value, "T", " ");
+   return StringToTime(value);
+}
+
+// Broker server time minus UTC, rounded to the nearest half hour.
+int ServerUtcOffsetSeconds()
+{
+   double difference = (double)(TimeTradeServer() - TimeGMT());
+   return (int)MathRound(difference / 1800.0) * 1800;
+}
+
+//--- API ------------------------------------------------------------------
+
+bool HttpPostJson(const string path, const string body, int &status, string &response)
+{
+   char request[];
+   char result[];
+   string resultHeaders;
+   string url = g_apiBaseUrl + path;
+   string headers = "Content-Type: application/json\r\nAccept: application/json\r\n";
+
+   int length = StringToCharArray(body, request, 0, WHOLE_ARRAY, CP_UTF8);
+   ArrayResize(request, MathMax(length - 1, 0)); // drop the trailing null
+
+   ResetLastError();
+   status = WebRequest("POST", url, headers, 2000, request, result, resultHeaders);
+
+   if(status < 0)
+   {
+      int errorCode = GetLastError();
+      SetFollowerDashboardError("WebRequest error " + IntegerToString(errorCode));
+      if(g_lastHttpStatus != -1)
+      {
+         PrintFormat("CopyTradeFollower: WebRequest failed. error=%d url=%s",
+            errorCode, url);
+         if(errorCode == 4014 || errorCode == 4060)
+            PrintFormat("CopyTradeFollower: add %s to the MT5 WebRequest allowlist.",
+               g_apiBaseUrl);
+      }
+      g_lastHttpStatus = -1;
+      return false;
+   }
+
+   response = CharArrayToString(result, 0, WHOLE_ARRAY, CP_UTF8);
+   return true;
+}
+
+string ReportableError()
+{
+   if(g_lastFollowerError == "NONE" || g_lastFollowerError == "WAITING FOR API")
+      return "";
+   return g_lastFollowerError;
+}
+
+string BuildSyncRequest()
+{
+   string positions = "";
+   int offset = ServerUtcOffsetSeconds();
+   int total = PositionsTotal();
+
+   for(int index = 0; index < total; index++)
+   {
+      ulong ticket = PositionGetTicket(index);
+      if(ticket == 0)
+         continue;
+
+      string masterTicket = "";
+      IsOwnedPosition(ticket, masterTicket);
+
+      string symbol = PositionGetString(POSITION_SYMBOL);
+      int digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
+      ENUM_POSITION_TYPE type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+      double profit = PositionGetDouble(POSITION_PROFIT) + PositionGetDouble(POSITION_SWAP);
+      datetime openTime = (datetime)PositionGetInteger(POSITION_TIME) - offset;
+
+      if(StringLen(positions) > 0)
+         positions += ",";
+
+      positions += "{" +
+         "\"ticket\":\"" + (string)ticket + "\"," +
+         "\"symbol\":" + JsonString(symbol) + "," +
+         "\"type\":\"" + (type == POSITION_TYPE_BUY ? "BUY" : "SELL") + "\"," +
+         "\"volume\":" + DoubleToString(PositionGetDouble(POSITION_VOLUME), 8) + "," +
+         "\"openPrice\":" + DoubleToString(PositionGetDouble(POSITION_PRICE_OPEN), digits) + "," +
+         "\"currentPrice\":" + DoubleToString(PositionGetDouble(POSITION_PRICE_CURRENT), digits) + "," +
+         "\"stopLoss\":" + DoubleToString(PositionGetDouble(POSITION_SL), digits) + "," +
+         "\"takeProfit\":" + DoubleToString(PositionGetDouble(POSITION_TP), digits) + "," +
+         "\"profit\":" + DoubleToString(profit, 2) + "," +
+         "\"masterTicket\":" + JsonNullableString(masterTicket) + "," +
+         "\"openTime\":\"" + IsoUtc(openTime) + "\"" +
+         "}";
+   }
+
+   return "{" +
+      "\"accountNumber\":\"" + AccountLogin() + "\"," +
+      "\"broker\":" + JsonString(AccountInfoString(ACCOUNT_COMPANY)) + "," +
+      "\"server\":" + JsonString(AccountInfoString(ACCOUNT_SERVER)) + "," +
+      "\"name\":" + JsonString(AccountInfoString(ACCOUNT_NAME)) + "," +
+      "\"currency\":" + JsonString(AccountInfoString(ACCOUNT_CURRENCY)) + "," +
+      "\"balance\":" + DoubleToString(AccountInfoDouble(ACCOUNT_BALANCE), 2) + "," +
+      "\"equity\":" + DoubleToString(AccountInfoDouble(ACCOUNT_EQUITY), 2) + "," +
+      "\"positions\":[" + positions + "]," +
+      "\"appliedSettingsVersion\":" + IntegerToString(g_settingsVersion) + "," +
+      "\"autoStopReason\":" + JsonNullableString(g_autoStopReason) + "," +
+      "\"lastError\":" + JsonNullableString(ReportableError()) + "," +
+      "\"timestamp\":\"" + IsoUtc(TimeGMT()) + "\"" +
+      "}";
+}
+
+bool ParseMasterPositions(const string stateJson, MasterPosition &positions[])
+{
+   ArrayResize(positions, 0);
+
+   string positionsJson;
+   string objects[];
+   if(!ExtractJsonArray(stateJson, "positions", positionsJson) ||
+      SplitJsonObjects(positionsJson, objects) < 0)
+      return false;
+
+   for(int index = 0; index < ArraySize(objects); index++)
+   {
       MasterPosition position;
       string type;
 
-      if(!ExtractJsonScalar(objectJson, "ticket", position.ticket) ||
-         !ExtractJsonScalar(objectJson, "symbol", position.symbol) ||
-         !ExtractJsonScalar(objectJson, "type", type) ||
-         !ExtractJsonNumber(objectJson, "volume", position.volume) ||
-         !ExtractJsonNumber(objectJson, "openPrice", position.openPrice) ||
-         !ExtractJsonNumber(objectJson, "stopLoss", position.stopLoss) ||
-         !ExtractJsonNumber(objectJson, "takeProfit", position.takeProfit))
+      if(!ExtractJsonScalar(objects[index], "ticket", position.ticket) ||
+         !ExtractJsonScalar(objects[index], "symbol", position.symbol) ||
+         !ExtractJsonScalar(objects[index], "type", type) ||
+         !ExtractJsonNumber(objects[index], "volume", position.volume) ||
+         !ExtractJsonNumber(objects[index], "openPrice", position.openPrice) ||
+         !ExtractJsonNumber(objects[index], "stopLoss", position.stopLoss) ||
+         !ExtractJsonNumber(objects[index], "takeProfit", position.takeProfit))
          return false;
 
       position.ticket = Trim(position.ticket);
@@ -433,74 +780,209 @@ bool ParseMasterPositions(const string json, MasterPosition &positions[])
       int size = ArraySize(positions);
       ArrayResize(positions, size + 1);
       positions[size] = position;
-      cursor = objectEnd + 1;
    }
 
    return true;
 }
 
-bool FetchMasterPositions(MasterPosition &positions[])
+bool ParseLotMode(const string value, ENUM_COPY_LOT_MODE &mode)
 {
-   char requestBody[];
-   char responseBody[];
-   string responseHeaders;
-   string headers = "Accept: application/json\r\n";
-
-   ResetLastError();
-   int status = WebRequest(
-      "GET",
-      ApiUrl,
-      headers,
-      2000,
-      requestBody,
-      responseBody,
-      responseHeaders);
-
-   if(status < 0)
-   {
-      int errorCode = GetLastError();
-      g_apiOnline = false;
-      g_lastHttpStatus = -1;
-      SetFollowerDashboardError("WebRequest error " + IntegerToString(errorCode));
-      PrintFormat("CopyTradeFollower: WebRequest failed. error=%d url=%s",
-         errorCode, ApiUrl);
-      if(errorCode == 4060)
-         Print("CopyTradeFollower: add http://127.0.0.1:4000 to the MT5 WebRequest allowlist.");
+   if(value == "SAME_AS_MASTER")
+      mode = SAME_AS_MASTER;
+   else if(value == "FIXED")
+      mode = FIXED;
+   else if(value == "MULTIPLIER")
+      mode = MULTIPLIER;
+   else if(value == "STEP_LOT")
+      mode = STEP_LOT;
+   else
       return false;
+
+   return true;
+}
+
+bool ApplySettings(const string json, const long version)
+{
+   if(g_haveSettings && version == g_settingsVersion)
+      return true;
+
+   CopySettings settings;
+   ZeroMemory(settings);
+   string lotMode;
+   double maxOpenPositions = 0.0;
+
+   if(!ExtractJsonBool(json, "copyBuy", settings.copyBuy) ||
+      !ExtractJsonBool(json, "copySell", settings.copySell) ||
+      !ExtractJsonBool(json, "copyStopLoss", settings.copyStopLoss) ||
+      !ExtractJsonBool(json, "copyTakeProfit", settings.copyTakeProfit) ||
+      !ExtractJsonBool(json, "copyModify", settings.copyModify) ||
+      !ExtractJsonBool(json, "copyClosedPositions", settings.copyClosedPositions) ||
+      !ExtractJsonScalar(json, "lotMode", lotMode) ||
+      !ParseLotMode(lotMode, settings.lotMode) ||
+      !ExtractJsonNumber(json, "fixedLot", settings.fixedLot) ||
+      !ExtractJsonNumber(json, "lotMultiplier", settings.lotMultiplier) ||
+      !ExtractJsonNumber(json, "maxLot", settings.maxLot) ||
+      !ExtractJsonNumber(json, "stepStartMultiplier", settings.stepStartMultiplier) ||
+      !ExtractJsonNumber(json, "stepMultiplier", settings.stepMultiplier) ||
+      !ExtractJsonNumber(json, "stepMinMultiplier", settings.stepMinMultiplier) ||
+      !ExtractJsonNumber(json, "stepMaxMultiplier", settings.stepMaxMultiplier) ||
+      !ExtractJsonBool(json, "autoDetectSymbol", settings.autoDetectSymbol) ||
+      !ExtractJsonNumber(json, "maxOpenPositions", maxOpenPositions) ||
+      !ExtractJsonNumber(json, "maxDailyLossPercent", settings.maxDailyLossPercent) ||
+      !ExtractJsonBool(json, "closeAllOnDailyLoss", settings.closeAllOnDailyLoss))
+      return false;
+
+   settings.maxOpenPositions = (int)maxOpenPositions;
+
+   if(settings.fixedLot <= 0.0 || settings.lotMultiplier <= 0.0 ||
+      settings.maxLot <= 0.0 || settings.stepStartMultiplier <= 0.0 ||
+      settings.stepMinMultiplier <= 0.0 || settings.stepMaxMultiplier <= 0.0 ||
+      settings.stepMinMultiplier > settings.stepMaxMultiplier ||
+      settings.maxOpenPositions < 0 || settings.maxDailyLossPercent < 0.0)
+      return false;
+
+   string mappingsJson;
+   string mappings[];
+   if(!ExtractJsonArray(json, "symbolMappings", mappingsJson) ||
+      SplitJsonObjects(mappingsJson, mappings) < 0)
+      return false;
+
+   string masterSymbols[];
+   string followerSymbols[];
+   ArrayResize(masterSymbols, ArraySize(mappings));
+   ArrayResize(followerSymbols, ArraySize(mappings));
+   for(int index = 0; index < ArraySize(mappings); index++)
+   {
+      string masterSymbol;
+      string followerSymbol;
+      if(!ExtractJsonScalar(mappings[index], "master", masterSymbol) ||
+         !ExtractJsonScalar(mappings[index], "follower", followerSymbol))
+         return false;
+
+      masterSymbols[index] = masterSymbol;
+      followerSymbols[index] = followerSymbol;
    }
 
-   string response =
-      CharArrayToString(responseBody, 0, WHOLE_ARRAY, CP_UTF8);
+   g_settings = settings;
+   ArrayFree(g_symbolMapMaster);
+   ArrayFree(g_symbolMapFollower);
+   ArrayCopy(g_symbolMapMaster, masterSymbols);
+   ArrayCopy(g_symbolMapFollower, followerSymbols);
+
+   // Symbol mappings may have changed.
+   ArrayResize(g_cachedMasterSymbols, 0);
+   ArrayResize(g_cachedFollowerSymbols, 0);
+
+   g_settingsVersion = version;
+   g_haveSettings = true;
+   PrintFormat("CopyTradeFollower: settings v%I64d applied. lotMode=%s maxOpen=%d dailyLoss=%.2f%%",
+      version, lotMode, settings.maxOpenPositions, settings.maxDailyLossPercent);
+   return true;
+}
+
+bool ApplySyncResponse(const string data,
+                       MasterPosition &positions[],
+                       string &commands[])
+{
+   string master;
+   string settings;
+   string commandsJson;
+   string pairing;
+   string stopReason;
+   bool masterOnline = false;
+   bool copyEnabled = false;
+   double settingsVersion = 0.0;
+
+   if(!ExtractJsonObject(data, "master", master) ||
+      !ExtractJsonBool(master, "online", masterOnline) ||
+      !ExtractJsonBool(data, "copyEnabled", copyEnabled) ||
+      !ExtractJsonNullableString(data, "stopReason", stopReason) ||
+      !ExtractJsonNumber(data, "settingsVersion", settingsVersion) ||
+      !ExtractJsonObject(data, "settings", settings) ||
+      !ExtractJsonArray(data, "commands", commandsJson) ||
+      !ExtractJsonObject(data, "pairing", pairing))
+      return false;
+
+   // The master state is null until the Master EA has posted once.
+   string state;
+   g_haveMasterState = ExtractJsonObject(master, "state", state);
+   ArrayResize(positions, 0);
+   if(g_haveMasterState)
+   {
+      if(!ParseMasterPositions(state, positions))
+         return false;
+
+      string masterAccount;
+      if(ExtractJsonScalar(state, "accountNumber", masterAccount))
+         g_masterAccountNumber = masterAccount;
+   }
+
+   if(!ApplySettings(settings, (long)settingsVersion) ||
+      SplitJsonObjects(commandsJson, commands) < 0)
+      return false;
+
+   string code;
+   string expiresAt;
+   if(ExtractJsonScalar(pairing, "code", code) &&
+      ExtractJsonScalar(pairing, "expiresAt", expiresAt))
+   {
+      g_pairingCode = code;
+      g_pairingExpiresAt = ParseIsoUtc(expiresAt);
+   }
+
+   g_masterOnline = masterOnline;
+   g_masterPositionCount = ArraySize(positions);
+   g_copyEnabled = copyEnabled;
+   g_stopReason = stopReason;
+
+   // The API has recorded our auto-stop once it reports copying as off.
+   if(!copyEnabled)
+      g_autoStopReason = "";
+
+   return true;
+}
+
+bool SyncWithApi(MasterPosition &positions[], string &commands[])
+{
+   int status;
+   string response;
+
+   if(!HttpPostJson("/api/follower/sync", BuildSyncRequest(), status, response))
+   {
+      g_apiOnline = false;
+      return false;
+   }
 
    if(status != 200)
    {
       g_apiOnline = false;
-      g_lastHttpStatus = status;
       SetFollowerDashboardError("HTTP " + IntegerToString(status));
-      PrintFormat("CopyTradeFollower: API returned HTTP %d. response=%s",
-         status, response);
+      if(status != g_lastHttpStatus)
+         PrintFormat("CopyTradeFollower: API returned HTTP %d. response=%s",
+            status, response);
+      g_lastHttpStatus = status;
       return false;
    }
 
-   if(!ParseMasterPositions(response, positions))
+   g_lastHttpStatus = status;
+
+   string data;
+   if(!ExtractJsonObject(response, "data", data) ||
+      !ApplySyncResponse(data, positions, commands))
    {
       g_apiOnline = false;
-      g_lastHttpStatus = status;
       SetFollowerDashboardError("Invalid API JSON");
-      Print("CopyTradeFollower: invalid master-state JSON; no trades were changed.");
+      Print("CopyTradeFollower: invalid sync response; no trades were changed.");
       return false;
    }
 
-   string masterAccount;
-   if(ExtractJsonScalar(response, "accountNumber", masterAccount))
-      g_masterAccountNumber = masterAccount;
-   g_masterPositionCount = ArraySize(positions);
    g_apiOnline = true;
-   g_lastHttpStatus = status;
    g_lastSuccessfulSync = TimeLocal();
    SetFollowerDashboardError("NONE");
    return true;
 }
+
+//--- Copied positions ---------------------------------------------------
 
 string MasterTicketFromComment(const string comment)
 {
@@ -570,23 +1052,46 @@ bool MasterPositionExists(const MasterPosition &positions[],
    return false;
 }
 
-string ManualMappedSymbol(const string masterSymbol)
+// Master tickets whose copy was closed from the dashboard. They are not copied
+// again while the master position stays open. Kept in terminal global
+// variables so an EA restart does not reopen them.
+string SkipKey(const string masterTicket)
 {
-   string mappings[];
-   ushort separator = StringGetCharacter(";", 0);
-   int count = StringSplit(ManualSymbolMapping, separator, mappings);
+   return "CAIO_SKIP_" + (string)MagicNumber + "_" + masterTicket;
+}
 
-   for(int index = 0; index < count; index++)
+bool IsSkippedMasterTicket(const string masterTicket)
+{
+   return GlobalVariableCheck(SkipKey(masterTicket));
+}
+
+void SkipMasterTicket(const string masterTicket)
+{
+   GlobalVariableSet(SkipKey(masterTicket), 1.0);
+}
+
+void PruneSkippedMasterTickets(const MasterPosition &positions[])
+{
+   string prefix = SkipKey("");
+
+   for(int index = GlobalVariablesTotal() - 1; index >= 0; index--)
    {
-      string pair = Trim(mappings[index]);
-      int equals = StringFind(pair, "=");
-      if(equals <= 0)
+      string name = GlobalVariableName(index);
+      if(!StartsWith(name, prefix))
          continue;
 
-      string source = Trim(StringSubstr(pair, 0, equals));
-      string target = Trim(StringSubstr(pair, equals + 1));
-      if(Upper(source) == Upper(masterSymbol) && StringLen(target) > 0)
-         return target;
+      if(!MasterPositionExists(positions, StringSubstr(name, StringLen(prefix))))
+         GlobalVariableDel(name);
+   }
+}
+
+string ManualMappedSymbol(const string masterSymbol)
+{
+   for(int index = 0; index < ArraySize(g_symbolMapMaster); index++)
+   {
+      if(Upper(Trim(g_symbolMapMaster[index])) == Upper(masterSymbol) &&
+         StringLen(Trim(g_symbolMapFollower[index])) > 0)
+         return Trim(g_symbolMapFollower[index]);
    }
 
    return "";
@@ -746,7 +1251,7 @@ string ResolveFollowerSymbol(const string masterSymbol)
    }
 
    string candidates[];
-   if(AutoDetectSymbol)
+   if(g_settings.autoDetectSymbol)
    {
       string masterBase = NormalizeSymbolBase(masterSymbol);
       int total = SymbolsTotal(false);
@@ -787,8 +1292,8 @@ string ResolveFollowerSymbol(const string masterSymbol)
    if(ArraySize(candidates) > 1)
    {
       g_lastSymbolMapping = "AMBIGUOUS: " + masterSymbol;
-      SetFollowerDashboardError("Manual symbol mapping required");
-      PrintFormat("CopyTradeFollower: ambiguous symbols for %s: [%s]. Add a ManualSymbolMapping entry.",
+      SetFollowerDashboardError("Symbol mapping required");
+      PrintFormat("CopyTradeFollower: ambiguous symbols for %s: [%s]. Add a symbol mapping in the dashboard.",
          masterSymbol, JoinSymbolCandidates(candidates));
       return "";
    }
@@ -813,9 +1318,10 @@ int VolumeDigits(const double step)
 
 double StepLotMultiplier(const int sequenceNumber)
 {
-   double multiplier = StepStartMultiplier +
-      (sequenceNumber - 1) * StepMultiplier;
-   return MathMax(StepMinMultiplier, MathMin(multiplier, StepMaxMultiplier));
+   double multiplier = g_settings.stepStartMultiplier +
+      (sequenceNumber - 1) * g_settings.stepMultiplier;
+   return MathMax(g_settings.stepMinMultiplier,
+      MathMin(multiplier, g_settings.stepMaxMultiplier));
 }
 
 double NormalizeFollowerVolume(const string symbol,
@@ -823,11 +1329,11 @@ double NormalizeFollowerVolume(const string symbol,
                                const int sequenceNumber)
 {
    double requested = masterVolume;
-   if(LotMode == FIXED)
-      requested = FixedLot;
-   else if(LotMode == MULTIPLIER)
-      requested = masterVolume * LotMultiplier;
-   else if(LotMode == STEP_LOT)
+   if(g_settings.lotMode == FIXED)
+      requested = g_settings.fixedLot;
+   else if(g_settings.lotMode == MULTIPLIER)
+      requested = masterVolume * g_settings.lotMultiplier;
+   else if(g_settings.lotMode == STEP_LOT)
       requested = masterVolume * StepLotMultiplier(sequenceNumber);
 
    double minimum = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MIN);
@@ -838,8 +1344,8 @@ double NormalizeFollowerVolume(const string symbol,
       return 0.0;
 
    double allowedMaximum = maximum;
-   if(MaxLot > 0.0)
-      allowedMaximum = MathMin(allowedMaximum, MaxLot);
+   if(g_settings.maxLot > 0.0)
+      allowedMaximum = MathMin(allowedMaximum, g_settings.maxLot);
    if(allowedMaximum < minimum)
       return 0.0;
 
@@ -889,11 +1395,11 @@ void PrepareOpenStops(const MasterPosition &master,
    stopLoss = 0.0;
    takeProfit = 0.0;
 
-   if(CopyStopLoss &&
+   if(g_settings.copyStopLoss &&
       IsValidStop(symbol, master.type, true, master.stopLoss, tick))
       stopLoss = NormalizePrice(symbol, master.stopLoss);
 
-   if(CopyTakeProfit &&
+   if(g_settings.copyTakeProfit &&
       IsValidStop(symbol, master.type, false, master.takeProfit, tick))
       takeProfit = NormalizePrice(symbol, master.takeProfit);
 }
@@ -956,12 +1462,22 @@ void LogTradeFailure(const string action,
 bool OpenCopiedPosition(const MasterPosition &master,
                         const int sequenceNumber)
 {
-   if((master.type == POSITION_TYPE_BUY && !CopyBuy) ||
-      (master.type == POSITION_TYPE_SELL && !CopySell))
+   if((master.type == POSITION_TYPE_BUY && !g_settings.copyBuy) ||
+      (master.type == POSITION_TYPE_SELL && !g_settings.copySell))
       return false;
 
    if(FindFollowerTicket(master.ticket) != 0)
       return true;
+
+   if(IsSkippedMasterTicket(master.ticket))
+      return false;
+
+   if(g_settings.maxOpenPositions > 0 &&
+      ArraySize(g_mappedMasterTickets) >= g_settings.maxOpenPositions)
+   {
+      SetFollowerDashboardError("Max open positions reached");
+      return false;
+   }
 
    string symbol = ResolveFollowerSymbol(master.symbol);
    if(StringLen(symbol) == 0)
@@ -1015,7 +1531,7 @@ bool OpenCopiedPosition(const MasterPosition &master,
       return false;
    }
 
-   if(LotMode == STEP_LOT)
+   if(g_settings.lotMode == STEP_LOT)
       PrintFormat("Copy AiO: step lot master=%s sequence=%d masterLot=%.8f multiplier=%.8f followerLot=%.8f",
          master.ticket, sequenceNumber, master.volume,
          StepLotMultiplier(sequenceNumber), volume);
@@ -1027,7 +1543,7 @@ bool OpenCopiedPosition(const MasterPosition &master,
 void ModifyCopiedPosition(const MasterPosition &master,
                           const ulong followerTicket)
 {
-   if(!CopyModify || !PositionSelectByTicket(followerTicket))
+   if(!g_settings.copyModify || !PositionSelectByTicket(followerTicket))
       return;
 
    string ownedMasterTicket;
@@ -1054,7 +1570,7 @@ void ModifyCopiedPosition(const MasterPosition &master,
    double desiredStopLoss = currentStopLoss;
    double desiredTakeProfit = currentTakeProfit;
 
-   if(CopyStopLoss)
+   if(g_settings.copyStopLoss)
    {
       if(master.stopLoss == 0.0)
          desiredStopLoss = 0.0;
@@ -1062,7 +1578,7 @@ void ModifyCopiedPosition(const MasterPosition &master,
          desiredStopLoss = NormalizePrice(symbol, master.stopLoss);
    }
 
-   if(CopyTakeProfit)
+   if(g_settings.copyTakeProfit)
    {
       if(master.takeProfit == 0.0)
          desiredTakeProfit = 0.0;
@@ -1083,7 +1599,7 @@ void ModifyCopiedPosition(const MasterPosition &master,
 
 void CloseMissingCopiedPositions(const MasterPosition &masterPositions[])
 {
-   if(!CopyClosedPositions)
+   if(!g_settings.copyClosedPositions)
       return;
 
    for(int index = ArraySize(g_mappedFollowerTickets) - 1; index >= 0; index--)
@@ -1107,7 +1623,9 @@ void CloseMissingCopiedPositions(const MasterPosition &masterPositions[])
    RebuildMasterTicketMapping();
 }
 
-void SynchronizeFollower(const MasterPosition &masterPositions[])
+// When copying is off, no new trades are opened, but positions that are
+// already copied keep following the master's closes and SL/TP changes.
+void SynchronizeFollower(const MasterPosition &masterPositions[], const bool allowOpen)
 {
    RebuildMasterTicketMapping();
    CloseMissingCopiedPositions(masterPositions);
@@ -1115,7 +1633,7 @@ void SynchronizeFollower(const MasterPosition &masterPositions[])
    for(int index = 0; index < ArraySize(masterPositions); index++)
    {
       ulong followerTicket = FindFollowerTicket(masterPositions[index].ticket);
-      if(followerTicket == 0)
+      if(followerTicket == 0 && allowOpen)
       {
          // The Master publishes active positions in ascending ticket order.
          // Include every Master position, even if an earlier copy failed.
@@ -1128,27 +1646,215 @@ void SynchronizeFollower(const MasterPosition &masterPositions[])
    }
 }
 
+//--- Risk -------------------------------------------------------------------
+
+// Loss since the start of the broker's trading day, as a percent of the
+// equity at that time. The day's starting equity survives EA restarts.
+double DailyLossPercent()
+{
+   string dayKey = "CAIO_DAY_" + AccountLogin();
+   string equityKey = "CAIO_DAYEQ_" + AccountLogin();
+   long now = (long)TimeTradeServer();
+   double today = (double)(now - now % 86400);
+   double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+
+   if(!GlobalVariableCheck(dayKey) || !GlobalVariableCheck(equityKey) ||
+      GlobalVariableGet(dayKey) != today)
+   {
+      GlobalVariableSet(dayKey, today);
+      GlobalVariableSet(equityKey, equity);
+      return 0.0;
+   }
+
+   double startEquity = GlobalVariableGet(equityKey);
+   if(startEquity <= 0.0)
+      return 0.0;
+
+   return (startEquity - equity) / startEquity * 100.0;
+}
+
+void CheckDailyLoss()
+{
+   // Always called so the day's starting equity rolls over on time.
+   double loss = DailyLossPercent();
+
+   if(g_settings.maxDailyLossPercent <= 0.0 || !IsCopying() ||
+      loss < g_settings.maxDailyLossPercent)
+      return;
+
+   g_autoStopReason = StringFormat("Daily loss limit reached (%.2f%%)", loss);
+   PrintFormat("CopyTradeFollower: %s. Copying stopped.", g_autoStopReason);
+
+   if(g_settings.closeAllOnDailyLoss)
+   {
+      string error;
+      CloseAllCopiedPositions(error);
+   }
+}
+
+//--- Dashboard commands -------------------------------------------------
+
+bool ClosePositionByCommand(const string ticketText, string &error)
+{
+   ulong ticket = (ulong)StringToInteger(ticketText);
+   if(ticket == 0 || !PositionSelectByTicket(ticket))
+   {
+      error = "Position not found";
+      return false;
+   }
+
+   string symbol = PositionGetString(POSITION_SYMBOL);
+   string masterTicket = "";
+   if(IsOwnedPosition(ticket, masterTicket))
+      SkipMasterTicket(masterTicket);
+
+   if(!TradeRequestSucceeded(g_trade.PositionClose(ticket)))
+   {
+      error = g_trade.ResultRetcodeDescription();
+      LogTradeFailure("close", masterTicket, symbol);
+      return false;
+   }
+
+   RebuildMasterTicketMapping();
+   return true;
+}
+
+// Closes every position this EA copied. Manual trades are left alone.
+bool CloseAllCopiedPositions(string &error)
+{
+   RebuildMasterTicketMapping();
+   int total = ArraySize(g_mappedFollowerTickets);
+   int failed = 0;
+
+   for(int index = 0; index < total; index++)
+   {
+      ulong ticket = g_mappedFollowerTickets[index];
+      SkipMasterTicket(g_mappedMasterTickets[index]);
+
+      if(!PositionSelectByTicket(ticket))
+         continue;
+
+      string symbol = PositionGetString(POSITION_SYMBOL);
+      if(!TradeRequestSucceeded(g_trade.PositionClose(ticket)))
+      {
+         failed++;
+         LogTradeFailure("close", g_mappedMasterTickets[index], symbol);
+      }
+   }
+
+   RebuildMasterTicketMapping();
+
+   if(failed > 0)
+   {
+      error = StringFormat("%d of %d positions failed to close", failed, total);
+      return false;
+   }
+
+   return true;
+}
+
+int FindDoneCommand(const string id)
+{
+   for(int index = 0; index < ArraySize(g_doneCommandIds); index++)
+   {
+      if(g_doneCommandIds[index] == id)
+         return index;
+   }
+
+   return -1;
+}
+
+int RememberCommand(const string id, const string status, const string error)
+{
+   if(ArraySize(g_doneCommandIds) >= MAX_REMEMBERED_COMMANDS)
+   {
+      ArrayRemove(g_doneCommandIds, 0, 1);
+      ArrayRemove(g_doneCommandStatuses, 0, 1);
+      ArrayRemove(g_doneCommandErrors, 0, 1);
+   }
+
+   int size = ArraySize(g_doneCommandIds);
+   ArrayResize(g_doneCommandIds, size + 1);
+   ArrayResize(g_doneCommandStatuses, size + 1);
+   ArrayResize(g_doneCommandErrors, size + 1);
+   g_doneCommandIds[size] = id;
+   g_doneCommandStatuses[size] = status;
+   g_doneCommandErrors[size] = error;
+   return size;
+}
+
+// A failed ack is retried on the next sync, because the API keeps sending the
+// command until it is acked.
+void AckCommand(const string id, const string status, const string error)
+{
+   string body = "{" +
+      "\"accountNumber\":\"" + AccountLogin() + "\"," +
+      "\"status\":\"" + status + "\"," +
+      "\"error\":" + JsonNullableString(error) +
+      "}";
+   int httpStatus;
+   string response;
+
+   if(HttpPostJson("/api/follower/commands/" + id + "/ack", body, httpStatus, response) &&
+      httpStatus != 200)
+      PrintFormat("CopyTradeFollower: command ack returned HTTP %d. id=%s response=%s",
+         httpStatus, id, response);
+}
+
+void ProcessCommands(const string &commands[])
+{
+   for(int index = 0; index < ArraySize(commands); index++)
+   {
+      string id;
+      string type;
+      string ticket = "";
+
+      if(!ExtractJsonScalar(commands[index], "id", id) ||
+         !ExtractJsonScalar(commands[index], "type", type))
+         continue;
+      ExtractJsonNullableString(commands[index], "ticket", ticket);
+
+      int done = FindDoneCommand(id);
+      if(done < 0)
+      {
+         string error = "";
+         bool succeeded = false;
+
+         if(!Enabled)
+            error = "EA is disabled on the terminal";
+         else if(type == "CLOSE_POSITION")
+            succeeded = ClosePositionByCommand(ticket, error);
+         else if(type == "CLOSE_ALL")
+            succeeded = CloseAllCopiedPositions(error);
+         else
+            error = "Unknown command: " + type;
+
+         done = RememberCommand(id, succeeded ? "done" : "failed", error);
+         PrintFormat("CopyTradeFollower: command %s %s -> %s %s",
+            type, ticket, g_doneCommandStatuses[done], error);
+      }
+
+      AckCommand(id, g_doneCommandStatuses[done], g_doneCommandErrors[done]);
+   }
+}
+
+//--- Events -------------------------------------------------------------
+
 int OnInit()
 {
-   if(StringLen(Trim(ApiUrl)) == 0)
+   g_apiBaseUrl = Trim(ApiBaseUrl);
+   while(StringLen(g_apiBaseUrl) > 0 && EndsWith(g_apiBaseUrl, "/"))
+      g_apiBaseUrl = StringSubstr(g_apiBaseUrl, 0, StringLen(g_apiBaseUrl) - 1);
+
+   if(StringLen(g_apiBaseUrl) == 0)
    {
-      Print("CopyTradeFollower: ApiUrl cannot be empty.");
+      Print("CopyTradeFollower: ApiBaseUrl cannot be empty.");
       return INIT_PARAMETERS_INCORRECT;
    }
 
    if(MagicNumber == 0)
    {
       Print("CopyTradeFollower: MagicNumber must be greater than zero.");
-      return INIT_PARAMETERS_INCORRECT;
-   }
-
-   if(!MathIsValidNumber(StepStartMultiplier) || StepStartMultiplier <= 0.0 ||
-      !MathIsValidNumber(StepMultiplier) ||
-      !MathIsValidNumber(StepMinMultiplier) || StepMinMultiplier <= 0.0 ||
-      !MathIsValidNumber(StepMaxMultiplier) || StepMaxMultiplier <= 0.0 ||
-      StepMinMultiplier > StepMaxMultiplier)
-   {
-      Print("Copy AiO: invalid step lot settings. Start, min, and max must be positive; min must not exceed max; all values must be finite.");
       return INIT_PARAMETERS_INCORRECT;
    }
 
@@ -1165,9 +1871,9 @@ int OnInit()
       return INIT_FAILED;
    }
 
-   PrintFormat("CopyTradeFollower started. enabled=%s url=%s interval=%dms mapped=%d",
+   PrintFormat("CopyTradeFollower started. enabled=%s api=%s interval=%dms mapped=%d",
       Enabled ? "true" : "false",
-      ApiUrl,
+      g_apiBaseUrl,
       g_syncIntervalMs,
       ArraySize(g_mappedMasterTickets));
    CreateFollowerDashboard();
@@ -1184,20 +1890,30 @@ void OnDeinit(const int reason)
 
 void OnTimer()
 {
-   if(!Enabled)
-   {
-      UpdateFollowerDashboard();
-      return;
-   }
-
    MasterPosition positions[];
-   if(!FetchMasterPositions(positions))
+   string commands[];
+
+   // Synced even when disabled, so the web dashboard still shows the account.
+   if(!SyncWithApi(positions, commands))
    {
       UpdateFollowerDashboard();
       return;
    }
 
-   SynchronizeFollower(positions);
+   ProcessCommands(commands);
+
+   if(Enabled && g_haveSettings)
+   {
+      CheckDailyLoss();
+
+      // Never trade from a stale snapshot of an offline master.
+      if(g_haveMasterState && g_masterOnline)
+      {
+         PruneSkippedMasterTickets(positions);
+         SynchronizeFollower(positions, IsCopying());
+      }
+   }
+
    UpdateFollowerDashboard();
 }
 //+------------------------------------------------------------------+
