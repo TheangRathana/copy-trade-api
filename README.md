@@ -27,10 +27,11 @@ generated from the same zod schemas the API validates with.
 
 All responses are `{ success, data }` or `{ success: false, error, issues? }`.
 
-### EA endpoints (localhost only)
+### EA endpoints
 
-Only requests from `127.0.0.1` / `::1` are accepted. Set `EA_ALLOWED_IPS`
-(comma-separated, or `*`) to allow other IPs, for example when running in Docker.
+Accepted when the EA sends the server's `EA_API_KEY` in the `X-EA-Key` header
+(from anywhere, e.g. through nginx), or when the EA runs on the same machine
+(`127.0.0.1` / `::1`, not through a proxy; `EA_ALLOWED_IPS` adds IPs).
 
 | Method | Path | Purpose |
 |---|---|---|
@@ -98,11 +99,15 @@ they survive a restart. Master state, follower status and commands are in memory
 
 ## Follower EA (`mt5/Copy AiO.mq5`)
 
-The EA has one input, `Enabled`. The API address (`http://127.0.0.1:4000`),
-sync interval (250 ms) and magic number (26090201) are fixed in the code. Copy
-and risk settings come from the API and are changed in the web dashboard. Add
-`http://127.0.0.1:4000` to MT5's WebRequest allowlist (Tools → Options →
-Expert Advisors).
+Inputs: **API key** (the server's `EA_API_KEY`), `Enabled` and the **Lot size**
+group. The API address (`https://copy-trade-api.salatrades.com`), sync interval
+and magic number (26090201) are fixed in the code. The other copy and risk
+settings come from the API and are changed in the web dashboard. Add
+`https://copy-trade-api.salatrades.com` to MT5's WebRequest allowlist (Tools →
+Options → Expert Advisors).
+
+The Master EA's `ApiUrl` defaults to
+`https://copy-trade-api.salatrades.com/api/master/state`; give it the same API key.
 
 - **Symbol = the chart's symbol.** Attach the Master EA to the XAUUSD chart: it
   only sends XAUUSD positions. Attach each follower to its broker's gold chart

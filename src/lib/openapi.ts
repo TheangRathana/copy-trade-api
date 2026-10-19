@@ -24,6 +24,7 @@ export const TAGS = {
 } as const;
 
 export const ADMIN_SECURITY = [{ adminKey: [] }];
+export const EA_SECURITY = [{ eaKey: [] }];
 export const SESSION_SECURITY = [{ sessionToken: [] }];
 
 // Swagger UI at /docs, the OpenAPI spec at /docs/json. Register before the routes.
@@ -39,7 +40,8 @@ export function registerDocs(app: FastifyInstance): void {
         version: "1.0.0",
         description:
           "Copies trades from master MT5 accounts to follower accounts.\n\n" +
-          "- **EA** endpoints: only for the MT5 EAs on the same server.\n" +
+          "- **EA** endpoints: for the MT5 EAs. They send the server's EA_API_KEY in the " +
+          "`X-EA-Key` header (or run on the same machine as the API).\n" +
           "- **Auth / Dashboard**: the web dashboard. Log in with the account number and the " +
           "6-digit code from the follower EA's chart, then send the token as a Bearer token.\n" +
           "- **Admin**: manage masters and followers with the ADMIN_API_KEY as a Bearer token.\n\n" +
@@ -47,7 +49,7 @@ export function registerDocs(app: FastifyInstance): void {
       },
       tags: [
         { name: TAGS.health },
-        { name: TAGS.ea, description: "Called by the MT5 EAs on the same server only" },
+        { name: TAGS.ea, description: "Called by the MT5 EAs with the X-EA-Key header" },
         { name: TAGS.auth, description: "Dashboard login with the EA's pairing code" },
         { name: TAGS.dashboard, description: "The logged-in follower account" },
         { name: TAGS.admin, description: "Masters, followers and who follows whom" },
@@ -58,6 +60,12 @@ export function registerDocs(app: FastifyInstance): void {
             type: "http",
             scheme: "bearer",
             description: "The server's ADMIN_API_KEY",
+          },
+          eaKey: {
+            type: "apiKey",
+            in: "header",
+            name: "X-EA-Key",
+            description: "The server's EA_API_KEY",
           },
           sessionToken: {
             type: "http",

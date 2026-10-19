@@ -2,7 +2,7 @@ import type { FastifyPluginAsync } from "fastify";
 import { config } from "../../config.js";
 import type { ChangeFeed } from "../../lib/change-feed.js";
 import { eaOnly } from "../../lib/ea-guard.js";
-import { jsonSchema, TAGS } from "../../lib/openapi.js";
+import { EA_SECURITY, jsonSchema, TAGS } from "../../lib/openapi.js";
 import { masterStateSchema } from "./master.schema.js";
 import type { MasterStateStore } from "../../stores/master-state.store.js";
 import type { AccountRepository } from "../accounts/accounts.types.js";
@@ -22,13 +22,14 @@ export const masterRoutes: FastifyPluginAsync<MasterRoutesOptions> = async (
   const service = new MasterService(masterStore, accountRepository, changeFeed);
   const controller = new MasterController(service);
 
-  app.addHook("onRequest", eaOnly(config.eaAllowedIps));
+  app.addHook("onRequest", eaOnly(config.eaAllowedIps, config.eaApiKey));
 
   app.post(
     "/state",
     {
       schema: {
         tags: [TAGS.ea],
+        security: EA_SECURITY,
         summary: "Master EA posts its open positions",
         description:
           "Sent on every trade event and as a heartbeat. Only registered, enabled masters " +

@@ -15,12 +15,13 @@ export const authRoutes: FastifyPluginAsync<AuthStores> = async (
   const sessionGuard = requireSession(stores.sessionStore);
 
   // Per-account lockout is the main brute-force protection; this caps volume.
-  // Behind a Cloudflare Tunnel every request comes from 127.0.0.1, so limit
-  // by the visitor's IP that Cloudflare passes on.
+  // Behind a Cloudflare Tunnel or nginx every request comes from the proxy,
+  // so limit by the visitor's IP the proxy passes on. The API only listens on
+  // localhost, so these headers can only come from that proxy.
   await app.register(rateLimit, {
     global: false,
     keyGenerator: (request) => {
-      const visitorIp = request.headers["cf-connecting-ip"];
+      const visitorIp = request.headers["cf-connecting-ip"] ?? request.headers["x-real-ip"];
       return typeof visitorIp === "string" ? visitorIp : request.ip;
     },
   });

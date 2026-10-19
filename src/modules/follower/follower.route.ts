@@ -1,7 +1,7 @@
 import type { FastifyPluginAsync } from "fastify";
 import { config } from "../../config.js";
 import { eaOnly } from "../../lib/ea-guard.js";
-import { jsonSchema, TAGS } from "../../lib/openapi.js";
+import { EA_SECURITY, jsonSchema, TAGS } from "../../lib/openapi.js";
 import {
   commandAckParamsSchema,
   commandAckSchema,
@@ -17,13 +17,14 @@ export const followerRoutes: FastifyPluginAsync<FollowerStores> = async (
   const service = new FollowerService(stores);
   const controller = new FollowerController(service);
 
-  app.addHook("onRequest", eaOnly(config.eaAllowedIps));
+  app.addHook("onRequest", eaOnly(config.eaAllowedIps, config.eaApiKey));
 
   app.post(
     "/sync",
     {
       schema: {
         tags: [TAGS.ea],
+        security: EA_SECURITY,
         summary: "Follower EA reports its status and gets what it needs",
         description:
           "Returns its master's positions, copy settings, pending commands and the " +
@@ -39,6 +40,7 @@ export const followerRoutes: FastifyPluginAsync<FollowerStores> = async (
     {
       schema: {
         tags: [TAGS.ea],
+        security: EA_SECURITY,
         summary: "Follower EA reports a command result",
         params: jsonSchema(commandAckParamsSchema),
         body: jsonSchema(commandAckSchema),

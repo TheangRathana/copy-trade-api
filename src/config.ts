@@ -23,6 +23,9 @@ export const config = {
   redisUrl: process.env.REDIS_URL?.trim() || null,
   // Bearer key for /api/admin (managing masters and followers). Unset = admin API off.
   adminApiKey: process.env.ADMIN_API_KEY?.trim() || null,
+  // Shared key the EAs send in X-EA-Key when they reach the API over the
+  // internet. Unset = EA endpoints only accept EAs on the same machine.
+  eaApiKey: process.env.EA_API_KEY?.trim() || null,
   // IPs allowed to call the EA endpoints. "*" allows any IP.
   eaAllowedIps: parseList(process.env.EA_ALLOWED_IPS) ?? LOOPBACK_IPS,
   masterOnlineMs: 10_000,

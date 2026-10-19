@@ -22,10 +22,10 @@ enum ENUM_COPY_LOT_MODE
    STEP_LOT       = 3  // Step lot
 };
 
-// Fixed for every follower: the API runs on the same VPS. Lot size is set in
-// the inputs below; the other copy and risk settings come from the API and are
-// edited in the web dashboard.
-#define API_BASE_URL      "http://127.0.0.1:4000"
+// Fixed for every follower. Lot size is set in the inputs below; the other
+// copy and risk settings come from the API and are edited in the web dashboard.
+// Add API_BASE_URL to MT5's WebRequest allowlist.
+#define API_BASE_URL      "https://copy-trade-api.salatrades.com"
 #define SYNC_INTERVAL_MS  100
 // Long polling: the API may hold a sync this long, answering the moment the
 // master's trades, the settings or a command change. The HTTP timeout must
@@ -37,6 +37,10 @@ enum ENUM_COPY_LOT_MODE
 #define COPY_MAGIC_NUMBER 26090201
 
 // The comment after each input is the label shown in MT5.
+input group "Connection"
+// The server's EA_API_KEY, sent in the X-EA-Key header
+input string ApiKey = ""; // API key (EA_API_KEY from the server)
+
 input group "Copy"
 // false keeps reporting to the dashboard but never trades
 input bool Enabled = true; // Enable copy trading on this terminal
@@ -713,7 +717,8 @@ bool HttpPostJson(const string path, const string body, int &status, string &res
    char result[];
    string resultHeaders;
    string url = API_BASE_URL + path;
-   string headers = "Content-Type: application/json\r\nAccept: application/json\r\n";
+   string headers = "Content-Type: application/json\r\nAccept: application/json\r\n" +
+      "X-EA-Key: " + ApiKey + "\r\n";
 
    int length = StringToCharArray(body, request, 0, WHOLE_ARRAY, CP_UTF8);
    ArrayResize(request, MathMax(length - 1, 0)); // drop the trailing null
@@ -1789,6 +1794,12 @@ int OnInit()
    if(LotMode == FIXED && FixedLot > MaxLot)
    {
       Print("CopyTradeFollower: Fixed lot must not be greater than Max lot per copied trade.");
+      return INIT_PARAMETERS_INCORRECT;
+   }
+
+   if(StringLen(ApiKey) == 0)
+   {
+      Print("CopyTradeFollower: set the API key input (EA_API_KEY from the server).");
       return INIT_PARAMETERS_INCORRECT;
    }
 

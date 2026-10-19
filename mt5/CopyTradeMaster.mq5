@@ -8,7 +8,9 @@
 #property description "Read-only Master account state publisher"
 
 input group "Copy Trade Master"
-input string ApiUrl                   = "http://127.0.0.1:4000/api/master/state";
+input string ApiUrl                   = "https://copy-trade-api.salatrades.com/api/master/state";
+// The server's EA_API_KEY; needed when the API is on another machine
+input string ApiKey                   = ""; // API key (EA_API_KEY from the server)
 input int    SyncIntervalMs           = 250;
 input int    HeartbeatIntervalSeconds = 5;
 
@@ -280,6 +282,8 @@ bool SendMasterState(const string json)
    char responseBody[];
    string responseHeaders;
    string headers = "Content-Type: application/json\r\n";
+   if(StringLen(ApiKey) > 0)
+      headers += "X-EA-Key: " + ApiKey + "\r\n";
 
    StringToCharArray(json, requestBody, 0, WHOLE_ARRAY, CP_UTF8);
    if(ArraySize(requestBody) > 0)
@@ -308,7 +312,7 @@ bool SendMasterState(const string json)
       if(errorCode == 4060)
       {
          Print(
-            "CopyTradeMaster: allow http://127.0.0.1:4000 under "
+            "CopyTradeMaster: allow https://copy-trade-api.salatrades.com under "
             "Tools > Options > Expert Advisors > "
             "Allow WebRequest for listed URL.");
       }
@@ -357,6 +361,12 @@ void PublishMasterStateIfNeeded()
 
 int OnInit()
 {
+   if(StringFind(ApiUrl, "https://") == 0 && StringLen(ApiKey) == 0)
+   {
+      Print("CopyTradeMaster: set the API key input (EA_API_KEY from the server).");
+      return INIT_PARAMETERS_INCORRECT;
+   }
+
    if(StringLen(ApiUrl) == 0)
    {
       Print("CopyTradeMaster: ApiUrl cannot be empty.");
