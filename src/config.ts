@@ -18,6 +18,9 @@ export const config = {
   dataDir: path.resolve(
     process.env.DATA_DIR ?? path.join("data", process.env.PORT ?? "4000"),
   ),
+  // Masters and followers are kept in Redis when set (e.g. rediss://...:25061/2),
+  // otherwise in DATA_DIR/accounts.json
+  redisUrl: process.env.REDIS_URL?.trim() || null,
   // Bearer key for /api/admin (managing masters and followers). Unset = admin API off.
   adminApiKey: process.env.ADMIN_API_KEY?.trim() || null,
   // IPs allowed to call the EA endpoints. "*" allows any IP.

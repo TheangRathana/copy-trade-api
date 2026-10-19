@@ -7,6 +7,9 @@ import { masterRoutes } from "./modules/master/master.route.js";
 import { adminRoutes } from "./modules/admin/admin.route.js";
 import { FileAccountRepository } from "./stores/account.repository.js";
 import { ChangeFeed } from "./lib/change-feed.js";
+import { registerDocs, TAGS } from "./lib/openapi.js";
+import { createRedis, redisReachable } from "./lib/redis.js";
+import { RedisAccountRepository } from "./stores/redis-account.repository.js";
 import { CommandStore } from "./stores/command.store.js";
 import { FollowerStore } from "./stores/follower.store.js";
 import { MasterStateStore } from "./stores/master-state.store.js";
@@ -18,6 +21,14 @@ export function buildApp(): FastifyInstance {
   const app = Fastify({
     logger: true,
   });
+
+  const redis = config.redisUrl ? createRedis(config.redisUrl) : null;
+  if (redis) {
+    redis.on("error", (error) => app.log.error({ err: error }, "Redis error"));
+    app.addHook("onClose", async () => {
+      await redis.quit();
+    });
+  }
 
   const stores = {
     masterStore: new MasterStateStore(),
@@ -34,17 +45,36 @@ export function buildApp(): FastifyInstance {
     }),
     sessionStore: new SessionStore(config.dataDir, config.sessionTtlMs),
     changeFeed: new ChangeFeed(),
-    // Swap for the Redis repository once Redis is connected
-    accountRepository: new FileAccountRepository(config.dataDir),
+    accountRepository: redis
+      ? new RedisAccountRepository(redis)
+      : new FileAccountRepository(config.dataDir),
   };
 
   app.decorateRequest("sessionAccount", "");
   app.decorateRequest("sessionToken", "");
 
-  app.get("/api/health", async () => ({
-    success: true,
-    status: "ok",
-  }));
+  registerDocs(app);
+
+  // Registered as a plugin so it loads after the docs and shows up in them
+  void app.register(async (instance) => {
+    instance.get(
+      "/api/health",
+      {
+        schema: {
+          tags: [TAGS.health],
+          summary: "Is the API up?",
+          description: "503 when Redis is configured but not answering.",
+        },
+      },
+      async (_request, reply) => {
+        const storage = redis ? "redis" : "file";
+        if (redis && !(await redisReachable(redis))) {
+          return reply.status(503).send({ success: false, status: "redis_unreachable", storage });
+        }
+        return { success: true, status: "ok", storage };
+      },
+    );
+  });
 
   // EA endpoints (localhost only).
   void app.register(masterRoutes, { prefix: "/api/master", ...stores });

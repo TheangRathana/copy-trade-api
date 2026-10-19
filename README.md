@@ -3,7 +3,7 @@
 ## Docker (production server)
 
 ```sh
-cp .env.example .env    # set ADMIN_API_KEY
+cp .env.example .env    # set ADMIN_API_KEY and REDIS_URL
 docker compose up -d --build
 ```
 
@@ -21,6 +21,9 @@ Local development defaults to `127.0.0.1:4000`. Set `HOST` and `PORT` to overrid
 the listening address.
 
 ## API
+
+Interactive docs (Swagger UI) at `/docs`, OpenAPI spec at `/docs/json`. They are
+generated from the same zod schemas the API validates with.
 
 All responses are `{ success, data }` or `{ success: false, error, issues? }`.
 
@@ -55,8 +58,20 @@ once it is registered, and an unregistered follower copies nothing.
 | PATCH | `/api/admin/followers/:account` | `{ masterAccount?, name?, note? }` Move it to another master |
 | DELETE | `/api/admin/followers/:account` | Also removes its settings and logs out its sessions |
 
-Masters and followers are saved in `DATA_DIR/accounts.json` until Redis is
-connected (implement `AccountRepository` in `src/modules/accounts/accounts.types.ts`).
+Masters and followers are stored in **Redis** when `REDIS_URL` is set (for
+example `rediss://default:PASSWORD@host:25061/2`), otherwise in
+`DATA_DIR/accounts.json`. All keys start with `ct:`:
+
+| Key | Type | Content |
+|---|---|---|
+| `ct:masters` | SET | All master account numbers |
+| `ct:master:{acct}` | HASH | `accountNumber`, `name`, `note`, `enabled` (1/0), `createdAt`, `updatedAt` |
+| `ct:master:{acct}:followers` | SET | Accounts following this master |
+| `ct:followers` | SET | All follower account numbers |
+| `ct:follower:{acct}` | HASH | `accountNumber`, `masterAccount`, `name`, `note`, `createdAt`, `updatedAt` |
+
+`GET /api/health` reports `storage` (`redis` or `file`) and answers 503 when
+Redis is set but not reachable.
 
 ### UI endpoints
 
