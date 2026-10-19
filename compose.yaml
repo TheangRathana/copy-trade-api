@@ -1,13 +1,42 @@
-services:
-  api-4001:
-    build: .
-    image: copy-trade-api:local
-    restart: unless-stopped
-    ports:
-      - "4001:4000"
+# copy-trade-api — production stack
+#
+#   docker compose up -d --build
+#
+# API on 127.0.0.1:4200 only; nginx on the host provides HTTPS.
+# Secrets (ADMIN_API_KEY) live in .env on the server, never in the image.
 
-  api-4002:
-    image: copy-trade-api:local
+name: copy-trade-api
+
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: copy-trade-api:latest
+    container_name: copy-trade-api
     restart: unless-stopped
+    init: true
+    env_file:
+      - path: .env
+        required: true
+    # These override .env so a dev value can't break the container
+    environment:
+      NODE_ENV: production
+      HOST: 0.0.0.0
+      PORT: 4000
+      DATA_DIR: /app/data
     ports:
-      - "4002:4000"
+      # Host loopback only: reachable from the server itself, never from the internet
+      - "127.0.0.1:4200:4000"
+    volumes:
+      - api-data:/app/data
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 15s
+
+volumes:
+  api-data:
