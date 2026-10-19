@@ -16,7 +16,7 @@ export class DashboardController {
   ): Promise<void> => {
     await reply.send({
       success: true,
-      data: this.service.getAccount(request.sessionAccount),
+      data: await this.service.getAccount(request.sessionAccount),
     });
   };
 
@@ -35,7 +35,7 @@ export class DashboardController {
       return;
     }
 
-    const result = this.service.updateSettings(request.sessionAccount, patch.data);
+    const result = await this.service.updateSettings(request.sessionAccount, patch.data);
 
     if (!result.success) {
       await reply.status(400).send({
@@ -55,7 +55,7 @@ export class DashboardController {
   ): Promise<void> => {
     await reply.send({
       success: true,
-      data: this.service.startCopy(request.sessionAccount),
+      data: await this.service.startCopy(request.sessionAccount),
     });
   };
 
@@ -76,7 +76,7 @@ export class DashboardController {
 
     await reply.send({
       success: true,
-      data: this.service.stopCopy(request.sessionAccount, result.data.closeAll),
+      data: await this.service.stopCopy(request.sessionAccount, result.data.closeAll),
     });
   };
 

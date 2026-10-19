@@ -18,6 +18,8 @@ export const config = {
   dataDir: path.resolve(
     process.env.DATA_DIR ?? path.join("data", process.env.PORT ?? "4000"),
   ),
+  // Bearer key for /api/admin (managing masters and followers). Unset = admin API off.
+  adminApiKey: process.env.ADMIN_API_KEY?.trim() || null,
   // IPs allowed to call the EA endpoints. "*" allows any IP.
   eaAllowedIps: parseList(process.env.EA_ALLOWED_IPS) ?? LOOPBACK_IPS,
   masterOnlineMs: 10_000,

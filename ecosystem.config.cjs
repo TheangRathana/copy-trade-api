@@ -8,7 +8,9 @@ module.exports = {
       autorestart: true,
       env: {
         NODE_ENV: "production",
-        HOST: "0.0.0.0",
+        // Local only: the EAs call 127.0.0.1 and the web UI comes in through
+        // the Cloudflare Tunnel, so the port is never exposed to the internet.
+        HOST: "127.0.0.1",
         PORT: 4000,
       },
     },

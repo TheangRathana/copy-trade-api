@@ -21,7 +21,7 @@ export class FollowerController {
       return;
     }
 
-    await reply.send({ success: true, data: this.service.sync(result.data) });
+    await reply.send({ success: true, data: await this.service.sync(result.data) });
   };
 
   ackCommand = async (

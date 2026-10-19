@@ -158,7 +158,7 @@ void UpdateMasterDashboard()
       AccountInfoInteger(ACCOUNT_LOGIN),
       broker,
       server,
-      PositionsTotal(),
+      ChartSymbolPositions(),
       MasterDashboardTime(g_lastSuccessfulSync),
       httpStatus);
 
@@ -175,12 +175,24 @@ void UpdateMasterDashboard()
    MasterDashboardSetLabel("BROKER", 81, "Broker: " + broker, clrWhite, 9);
    MasterDashboardSetLabel("SERVER", 99, "Server: " + server, clrWhite, 9);
    MasterDashboardSetLabel("POSITIONS", 117,
-      "Positions: " + IntegerToString(PositionsTotal()), clrWhite, 9);
+      _Symbol + " Positions: " + IntegerToString(ChartSymbolPositions()), clrWhite, 9);
    MasterDashboardSetLabel("SYNC", 135,
       "Last Sync: " + MasterDashboardTime(g_lastSuccessfulSync), clrWhite, 9);
    MasterDashboardSetLabel("HTTP", 153, "HTTP: " + httpStatus, clrWhite, 9);
    MasterDashboardSetLabel("STATUS", 171, "Status: RUNNING", C'70,220,130', 9);
    ChartRedraw();
+}
+
+int ChartSymbolPositions()
+{
+   int count = 0;
+   for(int index = PositionsTotal() - 1; index >= 0; index--)
+   {
+      ulong ticket = PositionGetTicket(index);
+      if(ticket > 0 && PositionGetString(POSITION_SYMBOL) == _Symbol)
+         count++;
+   }
+   return count;
 }
 
 void DeleteMasterDashboard()
@@ -222,7 +234,11 @@ string BuildMasterStateJson(string &snapshotForComparison)
          positionType != POSITION_TYPE_SELL)
          continue;
 
+      // Only the chart's symbol is copied: attach the Master to the XAUUSD chart
       string symbol = PositionGetString(POSITION_SYMBOL);
+      if(symbol != _Symbol)
+         continue;
+
       int priceDigits = SymbolPriceDigits(symbol);
 
       if(serializedCount > 0)
@@ -384,5 +400,19 @@ void OnTimer()
 {
    PublishMasterStateIfNeeded();
    UpdateMasterDashboard();
+}
+
+// Sends the moment a position opens, closes (deal added) or its SL/TP changes
+// (position changed), instead of waiting for the next timer tick. The timer
+// stays as a backup and for the heartbeat; unchanged state is never resent.
+void OnTradeTransaction(const MqlTradeTransaction &trans,
+                        const MqlTradeRequest &request,
+                        const MqlTradeResult &result)
+{
+   if(trans.type != TRADE_TRANSACTION_DEAL_ADD &&
+      trans.type != TRADE_TRANSACTION_POSITION)
+      return;
+
+   PublishMasterStateIfNeeded();
 }
 //+------------------------------------------------------------------+

@@ -13,25 +13,43 @@
 #define LEGACY_COPY_COMMENT_PREFIX "COPY_MASTER_"
 #define MAX_REMEMBERED_COMMANDS 100
 
+// The comments are the names shown in the MT5 inputs dropdown
 enum ENUM_COPY_LOT_MODE
 {
-   SAME_AS_MASTER = 0,
-   FIXED          = 1,
-   MULTIPLIER     = 2,
-   STEP_LOT       = 3
+   SAME_AS_MASTER = 0, // Same as master
+   FIXED          = 1, // Fixed lot
+   MULTIPLIER     = 2, // Master lot x multiplier
+   STEP_LOT       = 3  // Step lot
 };
 
-// Copy and risk settings now come from the API (edited in the web dashboard).
-input group "Connection"
-input string ApiBaseUrl     = "http://127.0.0.1:4000";
-input int    SyncIntervalMs = 250;
-input bool   Enabled        = true; // false = never trade from this terminal
+// Fixed for every follower: the API runs on the same VPS. Lot size is set in
+// the inputs below; the other copy and risk settings come from the API and are
+// edited in the web dashboard.
+#define API_BASE_URL      "http://127.0.0.1:4000"
+#define SYNC_INTERVAL_MS  100
+// Long polling: the API may hold a sync this long, answering the moment the
+// master's trades, the settings or a command change. The HTTP timeout must
+// stay above it.
+#define SYNC_WAIT_MS      1500
+#define HTTP_TIMEOUT_MS   5000
+// Marks the trades this EA copied. Keep it unchanged so positions copied
+// before an update are still recognised.
+#define COPY_MAGIC_NUMBER 26090201
 
+// The comment after each input is the label shown in MT5.
 input group "Copy"
-input ulong MagicNumber = 26090201;
+// false keeps reporting to the dashboard but never trades
+input bool Enabled = true; // Enable copy trading on this terminal
 
-input group "Dashboard"
-input bool ShowDashboard = true;
+input group "Lot size"
+input ENUM_COPY_LOT_MODE LotMode = SAME_AS_MASTER; // Lot mode
+input double FixedLot            = 0.01; // Fixed lot (Fixed lot mode)
+input double LotMultiplier       = 1.0;  // Multiplier (Master lot x multiplier mode)
+input double StepStartMultiplier = 1.0;  // Step lot: multiplier for the 1st trade
+input double StepMultiplier      = 0.5;  // Step lot: added for each next trade
+input double StepMinMultiplier   = 0.1;  // Step lot: lowest multiplier
+input double StepMaxMultiplier   = 10.0; // Step lot: highest multiplier
+input double MaxLot              = 10.0; // Max lot per copied trade
 
 struct MasterPosition
 {
@@ -52,49 +70,39 @@ struct CopySettings
    bool               copyTakeProfit;
    bool               copyModify;
    bool               copyClosedPositions;
-   ENUM_COPY_LOT_MODE lotMode;
-   double             fixedLot;
-   double             lotMultiplier;
-   double             maxLot;
-   double             stepStartMultiplier;
-   double             stepMultiplier;
-   double             stepMinMultiplier;
-   double             stepMaxMultiplier;
-   bool               autoDetectSymbol;
    int                maxOpenPositions;
    double             maxDailyLossPercent;
    bool               closeAllOnDailyLoss;
 };
 
 CTrade g_trade;
-int    g_syncIntervalMs = 250;
-string g_apiBaseUrl     = "";
 
 string g_mappedMasterTickets[];
 ulong  g_mappedFollowerTickets[];
-string g_cachedMasterSymbols[];
-string g_cachedFollowerSymbols[];
 bool     g_apiOnline             = false;
 int      g_lastHttpStatus        = 0;
 datetime g_lastSuccessfulSync    = 0;
 string   g_masterAccountNumber   = "N/A";
 int      g_masterPositionCount   = 0;
-string   g_lastSymbolMapping     = "WAITING";
 string   g_lastFollowerError     = "WAITING FOR API";
 string   g_followerDashboardState = "";
 
 // State received from the API.
 CopySettings g_settings;
-string   g_symbolMapMaster[];
-string   g_symbolMapFollower[];
 bool     g_haveSettings      = false;
 long     g_settingsVersion   = 0;
 bool     g_copyEnabled       = false;
 string   g_stopReason        = "";
 bool     g_masterOnline      = false;
+// Master state version received last; the API waits while it is still current
+long     g_masterVersion     = 0;
 bool     g_haveMasterState   = false;
 string   g_pairingCode       = "";
 datetime g_pairingExpiresAt  = 0;
+
+// Symbol problems repeat on every sync; log each distinct message once.
+// The list is cleared when new settings arrive, so problems are reported again.
+string g_loggedMessages[];
 
 // Set when this EA stops copying by itself; sent to the API until it records it.
 string   g_autoStopReason    = "";
@@ -155,12 +163,12 @@ void FollowerDashboardSetLabel(const string key,
       ObjectSetInteger(0, name, OBJPROP_CORNER, CORNER_LEFT_UPPER);
       ObjectSetInteger(0, name, OBJPROP_ANCHOR, ANCHOR_LEFT_UPPER);
       ObjectSetInteger(0, name, OBJPROP_XDISTANCE, 18);
-      ObjectSetInteger(0, name, OBJPROP_YDISTANCE, y);
       ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
       ObjectSetInteger(0, name, OBJPROP_HIDDEN, true);
       ObjectSetString(0, name, OBJPROP_FONT, "Consolas");
    }
 
+   ObjectSetInteger(0, name, OBJPROP_YDISTANCE, y);
    ObjectSetInteger(0, name, OBJPROP_FONTSIZE, fontSize);
    ObjectSetInteger(0, name, OBJPROP_COLOR, textColor);
    ObjectSetString(0, name, OBJPROP_TEXT, text);
@@ -168,9 +176,6 @@ void FollowerDashboardSetLabel(const string key,
 
 void CreateFollowerDashboard()
 {
-   if(!ShowDashboard)
-      return;
-
    string background = FOLLOWER_DASHBOARD_PREFIX + "BACKGROUND";
    if(ObjectFind(0, background) < 0)
    {
@@ -179,8 +184,6 @@ void CreateFollowerDashboard()
       ObjectSetInteger(0, background, OBJPROP_CORNER, CORNER_LEFT_UPPER);
       ObjectSetInteger(0, background, OBJPROP_XDISTANCE, 10);
       ObjectSetInteger(0, background, OBJPROP_YDISTANCE, 15);
-      ObjectSetInteger(0, background, OBJPROP_XSIZE, 360);
-      ObjectSetInteger(0, background, OBJPROP_YSIZE, 262);
       ObjectSetInteger(0, background, OBJPROP_BGCOLOR, C'20,24,32');
       ObjectSetInteger(0, background, OBJPROP_COLOR, C'65,75,92');
       ObjectSetInteger(0, background, OBJPROP_BORDER_TYPE, BORDER_FLAT);
@@ -188,6 +191,10 @@ void CreateFollowerDashboard()
       ObjectSetInteger(0, background, OBJPROP_SELECTABLE, false);
       ObjectSetInteger(0, background, OBJPROP_HIDDEN, true);
    }
+
+   // Sized on every call so a panel left from an older version grows to fit
+   ObjectSetInteger(0, background, OBJPROP_XSIZE, 360);
+   ObjectSetInteger(0, background, OBJPROP_YSIZE, 354);
 }
 
 bool IsCopying()
@@ -222,11 +229,57 @@ string PairingText()
       (int)(secondsLeft / 60), (int)(secondsLeft % 60));
 }
 
+//--- Risk settings shown on the panel ------------------------------------
+
+string OnOff(const bool value)
+{
+   return value ? "on" : "off";
+}
+
+string LotSettingsText()
+{
+   string maxLot = StringFormat("max %.2f", MaxLot);
+
+   if(LotMode == FIXED)
+      return StringFormat("Fixed %.2f, %s", FixedLot, maxLot);
+   if(LotMode == MULTIPLIER)
+      return StringFormat("Master x%.2f, %s", LotMultiplier, maxLot);
+   if(LotMode == STEP_LOT)
+      return StringFormat("Step x%.1f%+.1f [%.1f-%.1f], %s",
+         StepStartMultiplier, StepMultiplier,
+         StepMinMultiplier, StepMaxMultiplier, maxLot);
+   return "Same as master, " + maxLot;
+}
+
+string TradesSettingsText()
+{
+   return "BUY " + OnOff(g_settings.copyBuy) +
+      "  SELL " + OnOff(g_settings.copySell) +
+      "  SL " + OnOff(g_settings.copyStopLoss) +
+      "  TP " + OnOff(g_settings.copyTakeProfit);
+}
+
+string MaxPositionsText()
+{
+   if(g_settings.maxOpenPositions <= 0)
+      return "unlimited";
+   return StringFormat("%d / %d open", ArraySize(g_mappedMasterTickets),
+      g_settings.maxOpenPositions);
+}
+
+// Today's loss against the limit, e.g. "1.25% of 5.00%, then close all"
+string DailyLossText()
+{
+   if(g_settings.maxDailyLossPercent <= 0.0)
+      return "off";
+
+   return StringFormat("%.2f%% of %.2f%%%s",
+      MathMax(0.0, DailyLossPercent()), g_settings.maxDailyLossPercent,
+      g_settings.closeAllOnDailyLoss ? ", then close all" : "");
+}
+
 void UpdateFollowerDashboard()
 {
-   if(!ShowDashboard)
-      return;
-
    string apiStatus = g_apiOnline ? "ONLINE" : "ERROR";
    string broker = FollowerDashboardClip(AccountInfoString(ACCOUNT_COMPANY), 37);
    string master = g_masterAccountNumber +
@@ -236,11 +289,15 @@ void UpdateFollowerDashboard()
       ? "v" + IntegerToString(g_settingsVersion)
       : "WAITING";
    string pairing = PairingText();
-   string mapping = FollowerDashboardClip(g_lastSymbolMapping, 39);
    string lastError = FollowerDashboardClip(g_lastFollowerError, 39);
    int copiedPositions = ArraySize(g_mappedMasterTickets);
-   string displayState = StringFormat(
-      "%s|%s|%s|%s|%d|%d|%s|%s|%s|%s|%s|%s",
+   string waiting = "WAITING";
+   string lots = FollowerDashboardClip(LotSettingsText(), 34);
+   string trades = g_haveSettings ? TradesSettingsText() : waiting;
+   string maxPositions = g_haveSettings ? MaxPositionsText() : waiting;
+   string dailyLoss = g_haveSettings ? FollowerDashboardClip(DailyLossText(), 27) : waiting;
+   string displayState = lots + "|" + trades + "|" + maxPositions + "|" + dailyLoss + "|" + StringFormat(
+      "%s|%s|%s|%s|%d|%d|%s|%s|%s|%s|%s",
       apiStatus,
       AccountLogin(),
       broker,
@@ -250,7 +307,6 @@ void UpdateFollowerDashboard()
       copyStatus,
       settingsText,
       pairing,
-      mapping,
       FollowerDashboardTime(g_lastSuccessfulSync),
       lastError);
 
@@ -274,12 +330,22 @@ void UpdateFollowerDashboard()
       IsCopying() ? C'70,220,130' : C'255,180,90', 9);
    FollowerDashboardSetLabel("SETTINGS", 171, "Settings: " + settingsText,
       clrWhite, 9);
-   FollowerDashboardSetLabel("PAIRING", 189, "Dashboard Code: " + pairing,
+
+   color riskColor = C'200,205,215';
+   FollowerDashboardSetLabel("RISK_TITLE", 193, "RISK SETTINGS", C'80,200,255', 9);
+   FollowerDashboardSetLabel("RISK_LOT", 211, "Lot: " + lots, riskColor, 9);
+   FollowerDashboardSetLabel("RISK_TRADES", 229, "Trades: " + trades, riskColor, 9);
+   FollowerDashboardSetLabel("RISK_MAX_POS", 247, "Max Positions: " + maxPositions,
+      riskColor, 9);
+   FollowerDashboardSetLabel("RISK_DAILY", 265, "Daily Loss: " + dailyLoss,
+      StringLen(g_autoStopReason) > 0 ? C'255,100,100' : riskColor, 9);
+
+   FollowerDashboardSetLabel("PAIRING", 289, "Dashboard Code: " + pairing,
       C'80,200,255', 10);
-   FollowerDashboardSetLabel("SYMBOL", 209, "Symbol: " + mapping, clrWhite, 9);
-   FollowerDashboardSetLabel("SYNC", 227,
+   FollowerDashboardSetLabel("SYMBOL", 309, "Symbol: " + _Symbol + " (chart)", clrWhite, 9);
+   FollowerDashboardSetLabel("SYNC", 327,
       "Last Sync: " + FollowerDashboardTime(g_lastSuccessfulSync), clrWhite, 9);
-   FollowerDashboardSetLabel("ERROR", 245, "Last Error: " + lastError,
+   FollowerDashboardSetLabel("ERROR", 345, "Last Error: " + lastError,
       g_lastFollowerError == "NONE" ? clrWhite : C'255,180,90', 9);
    ChartRedraw();
 }
@@ -646,14 +712,14 @@ bool HttpPostJson(const string path, const string body, int &status, string &res
    char request[];
    char result[];
    string resultHeaders;
-   string url = g_apiBaseUrl + path;
+   string url = API_BASE_URL + path;
    string headers = "Content-Type: application/json\r\nAccept: application/json\r\n";
 
    int length = StringToCharArray(body, request, 0, WHOLE_ARRAY, CP_UTF8);
    ArrayResize(request, MathMax(length - 1, 0)); // drop the trailing null
 
    ResetLastError();
-   status = WebRequest("POST", url, headers, 2000, request, result, resultHeaders);
+   status = WebRequest("POST", url, headers, HTTP_TIMEOUT_MS, request, result, resultHeaders);
 
    if(status < 0)
    {
@@ -665,7 +731,7 @@ bool HttpPostJson(const string path, const string body, int &status, string &res
             errorCode, url);
          if(errorCode == 4014 || errorCode == 4060)
             PrintFormat("CopyTradeFollower: add %s to the MT5 WebRequest allowlist.",
-               g_apiBaseUrl);
+               API_BASE_URL);
       }
       g_lastHttpStatus = -1;
       return false;
@@ -673,6 +739,31 @@ bool HttpPostJson(const string path, const string body, int &status, string &res
 
    response = CharArrayToString(result, 0, WHOLE_ARRAY, CP_UTF8);
    return true;
+}
+
+string LotModeName()
+{
+   if(LotMode == FIXED)
+      return "FIXED";
+   if(LotMode == MULTIPLIER)
+      return "MULTIPLIER";
+   if(LotMode == STEP_LOT)
+      return "STEP_LOT";
+   return "SAME_AS_MASTER";
+}
+
+string LotSettingsJson()
+{
+   return "{" +
+      "\"lotMode\":\"" + LotModeName() + "\"," +
+      "\"fixedLot\":" + DoubleToString(FixedLot, 8) + "," +
+      "\"lotMultiplier\":" + DoubleToString(LotMultiplier, 8) + "," +
+      "\"maxLot\":" + DoubleToString(MaxLot, 8) + "," +
+      "\"stepStartMultiplier\":" + DoubleToString(StepStartMultiplier, 8) + "," +
+      "\"stepMultiplier\":" + DoubleToString(StepMultiplier, 8) + "," +
+      "\"stepMinMultiplier\":" + DoubleToString(StepMinMultiplier, 8) + "," +
+      "\"stepMaxMultiplier\":" + DoubleToString(StepMaxMultiplier, 8) +
+      "}";
 }
 
 string ReportableError()
@@ -730,7 +821,10 @@ string BuildSyncRequest()
       "\"balance\":" + DoubleToString(AccountInfoDouble(ACCOUNT_BALANCE), 2) + "," +
       "\"equity\":" + DoubleToString(AccountInfoDouble(ACCOUNT_EQUITY), 2) + "," +
       "\"positions\":[" + positions + "]," +
+      "\"lotSettings\":" + LotSettingsJson() + "," +
       "\"appliedSettingsVersion\":" + IntegerToString(g_settingsVersion) + "," +
+      "\"knownMasterVersion\":" + IntegerToString(g_masterVersion) + "," +
+      "\"waitMs\":" + IntegerToString(SYNC_WAIT_MS) + "," +
       "\"autoStopReason\":" + JsonNullableString(g_autoStopReason) + "," +
       "\"lastError\":" + JsonNullableString(ReportableError()) + "," +
       "\"timestamp\":\"" + IsoUtc(TimeGMT()) + "\"" +
@@ -785,22 +879,6 @@ bool ParseMasterPositions(const string stateJson, MasterPosition &positions[])
    return true;
 }
 
-bool ParseLotMode(const string value, ENUM_COPY_LOT_MODE &mode)
-{
-   if(value == "SAME_AS_MASTER")
-      mode = SAME_AS_MASTER;
-   else if(value == "FIXED")
-      mode = FIXED;
-   else if(value == "MULTIPLIER")
-      mode = MULTIPLIER;
-   else if(value == "STEP_LOT")
-      mode = STEP_LOT;
-   else
-      return false;
-
-   return true;
-}
-
 bool ApplySettings(const string json, const long version)
 {
    if(g_haveSettings && version == g_settingsVersion)
@@ -808,7 +886,6 @@ bool ApplySettings(const string json, const long version)
 
    CopySettings settings;
    ZeroMemory(settings);
-   string lotMode;
    double maxOpenPositions = 0.0;
 
    if(!ExtractJsonBool(json, "copyBuy", settings.copyBuy) ||
@@ -817,16 +894,6 @@ bool ApplySettings(const string json, const long version)
       !ExtractJsonBool(json, "copyTakeProfit", settings.copyTakeProfit) ||
       !ExtractJsonBool(json, "copyModify", settings.copyModify) ||
       !ExtractJsonBool(json, "copyClosedPositions", settings.copyClosedPositions) ||
-      !ExtractJsonScalar(json, "lotMode", lotMode) ||
-      !ParseLotMode(lotMode, settings.lotMode) ||
-      !ExtractJsonNumber(json, "fixedLot", settings.fixedLot) ||
-      !ExtractJsonNumber(json, "lotMultiplier", settings.lotMultiplier) ||
-      !ExtractJsonNumber(json, "maxLot", settings.maxLot) ||
-      !ExtractJsonNumber(json, "stepStartMultiplier", settings.stepStartMultiplier) ||
-      !ExtractJsonNumber(json, "stepMultiplier", settings.stepMultiplier) ||
-      !ExtractJsonNumber(json, "stepMinMultiplier", settings.stepMinMultiplier) ||
-      !ExtractJsonNumber(json, "stepMaxMultiplier", settings.stepMaxMultiplier) ||
-      !ExtractJsonBool(json, "autoDetectSymbol", settings.autoDetectSymbol) ||
       !ExtractJsonNumber(json, "maxOpenPositions", maxOpenPositions) ||
       !ExtractJsonNumber(json, "maxDailyLossPercent", settings.maxDailyLossPercent) ||
       !ExtractJsonBool(json, "closeAllOnDailyLoss", settings.closeAllOnDailyLoss))
@@ -834,49 +901,16 @@ bool ApplySettings(const string json, const long version)
 
    settings.maxOpenPositions = (int)maxOpenPositions;
 
-   if(settings.fixedLot <= 0.0 || settings.lotMultiplier <= 0.0 ||
-      settings.maxLot <= 0.0 || settings.stepStartMultiplier <= 0.0 ||
-      settings.stepMinMultiplier <= 0.0 || settings.stepMaxMultiplier <= 0.0 ||
-      settings.stepMinMultiplier > settings.stepMaxMultiplier ||
-      settings.maxOpenPositions < 0 || settings.maxDailyLossPercent < 0.0)
+   if(settings.maxOpenPositions < 0 || settings.maxDailyLossPercent < 0.0)
       return false;
-
-   string mappingsJson;
-   string mappings[];
-   if(!ExtractJsonArray(json, "symbolMappings", mappingsJson) ||
-      SplitJsonObjects(mappingsJson, mappings) < 0)
-      return false;
-
-   string masterSymbols[];
-   string followerSymbols[];
-   ArrayResize(masterSymbols, ArraySize(mappings));
-   ArrayResize(followerSymbols, ArraySize(mappings));
-   for(int index = 0; index < ArraySize(mappings); index++)
-   {
-      string masterSymbol;
-      string followerSymbol;
-      if(!ExtractJsonScalar(mappings[index], "master", masterSymbol) ||
-         !ExtractJsonScalar(mappings[index], "follower", followerSymbol))
-         return false;
-
-      masterSymbols[index] = masterSymbol;
-      followerSymbols[index] = followerSymbol;
-   }
 
    g_settings = settings;
-   ArrayFree(g_symbolMapMaster);
-   ArrayFree(g_symbolMapFollower);
-   ArrayCopy(g_symbolMapMaster, masterSymbols);
-   ArrayCopy(g_symbolMapFollower, followerSymbols);
-
-   // Symbol mappings may have changed.
-   ArrayResize(g_cachedMasterSymbols, 0);
-   ArrayResize(g_cachedFollowerSymbols, 0);
+   ArrayResize(g_loggedMessages, 0);
 
    g_settingsVersion = version;
    g_haveSettings = true;
-   PrintFormat("CopyTradeFollower: settings v%I64d applied. lotMode=%s maxOpen=%d dailyLoss=%.2f%%",
-      version, lotMode, settings.maxOpenPositions, settings.maxDailyLossPercent);
+   PrintFormat("CopyTradeFollower: settings v%I64d applied. maxOpen=%d dailyLoss=%.2f%%",
+      version, settings.maxOpenPositions, settings.maxDailyLossPercent);
    return true;
 }
 
@@ -931,6 +965,10 @@ bool ApplySyncResponse(const string data,
    }
 
    g_masterOnline = masterOnline;
+
+   double masterVersion;
+   if(ExtractJsonNumber(master, "version", masterVersion))
+      g_masterVersion = (long)masterVersion;
    g_masterPositionCount = ArraySize(positions);
    g_copyEnabled = copyEnabled;
    g_stopReason = stopReason;
@@ -1001,7 +1039,7 @@ bool IsOwnedPosition(const ulong positionTicket, string &masterTicket)
    if(!PositionSelectByTicket(positionTicket))
       return false;
 
-   if((ulong)PositionGetInteger(POSITION_MAGIC) != MagicNumber)
+   if((ulong)PositionGetInteger(POSITION_MAGIC) != COPY_MAGIC_NUMBER)
       return false;
 
    masterTicket = MasterTicketFromComment(PositionGetString(POSITION_COMMENT));
@@ -1018,7 +1056,8 @@ void RebuildMasterTicketMapping()
    {
       ulong followerTicket = PositionGetTicket(index);
       string masterTicket;
-      if(followerTicket == 0 || !IsOwnedPosition(followerTicket, masterTicket))
+      if(followerTicket == 0 || !IsOwnedPosition(followerTicket, masterTicket) ||
+         PositionGetString(POSITION_SYMBOL) != _Symbol)
          continue;
 
       int size = ArraySize(g_mappedMasterTickets);
@@ -1057,7 +1096,7 @@ bool MasterPositionExists(const MasterPosition &positions[],
 // variables so an EA restart does not reopen them.
 string SkipKey(const string masterTicket)
 {
-   return "CAIO_SKIP_" + (string)MagicNumber + "_" + masterTicket;
+   return "CAIO_SKIP_" + IntegerToString(COPY_MAGIC_NUMBER) + "_" + masterTicket;
 }
 
 bool IsSkippedMasterTicket(const string masterTicket)
@@ -1083,38 +1122,6 @@ void PruneSkippedMasterTickets(const MasterPosition &positions[])
       if(!MasterPositionExists(positions, StringSubstr(name, StringLen(prefix))))
          GlobalVariableDel(name);
    }
-}
-
-string ManualMappedSymbol(const string masterSymbol)
-{
-   for(int index = 0; index < ArraySize(g_symbolMapMaster); index++)
-   {
-      if(Upper(Trim(g_symbolMapMaster[index])) == Upper(masterSymbol) &&
-         StringLen(Trim(g_symbolMapFollower[index])) > 0)
-         return Trim(g_symbolMapFollower[index]);
-   }
-
-   return "";
-}
-
-string CachedFollowerSymbol(const string masterSymbol)
-{
-   for(int index = 0; index < ArraySize(g_cachedMasterSymbols); index++)
-   {
-      if(g_cachedMasterSymbols[index] == masterSymbol)
-         return g_cachedFollowerSymbols[index];
-   }
-
-   return "";
-}
-
-void CacheFollowerSymbol(const string masterSymbol, const string followerSymbol)
-{
-   int size = ArraySize(g_cachedMasterSymbols);
-   ArrayResize(g_cachedMasterSymbols, size + 1);
-   ArrayResize(g_cachedFollowerSymbols, size + 1);
-   g_cachedMasterSymbols[size] = masterSymbol;
-   g_cachedFollowerSymbols[size] = followerSymbol;
 }
 
 bool EndsWith(const string value, const string suffix)
@@ -1204,105 +1211,24 @@ string NormalizeSymbolBase(const string symbol)
    return compact;
 }
 
-string ResolveManualSymbol(const string masterSymbol)
+// "XAUUSD" on the master and "XAUUSDs" on this chart are the same instrument
+bool IsSameInstrument(const string masterSymbol)
 {
-   string manual = ManualMappedSymbol(masterSymbol);
-   if(StringLen(manual) == 0)
-      return "";
-
-   if(!SymbolSelect(manual, true))
-   {
-      SetFollowerDashboardError("Manual symbol unavailable: " + manual);
-      PrintFormat("CopyTradeFollower: manual symbol mapping unavailable: %s -> %s",
-         masterSymbol, manual);
-      return "";
-   }
-
-   CacheFollowerSymbol(masterSymbol, manual);
-   g_lastSymbolMapping = masterSymbol + " -> " + manual + " (manual)";
-   return manual;
+   return NormalizeSymbolBase(masterSymbol) == NormalizeSymbolBase(_Symbol);
 }
 
-string JoinSymbolCandidates(const string &candidates[])
+void PrintOnce(const string message)
 {
-   string result = "";
-   for(int index = 0; index < ArraySize(candidates); index++)
+   for(int index = 0; index < ArraySize(g_loggedMessages); index++)
    {
-      if(index > 0)
-         result += ", ";
-      result += candidates[index];
+      if(g_loggedMessages[index] == message)
+         return;
    }
 
-   return result;
-}
-
-string ResolveFollowerSymbol(const string masterSymbol)
-{
-   string cached = CachedFollowerSymbol(masterSymbol);
-   if(StringLen(cached) > 0 && SymbolSelect(cached, true))
-      return cached;
-
-   // An exact broker symbol always wins, even if normalized alternatives exist.
-   if(SymbolSelect(masterSymbol, true))
-   {
-      CacheFollowerSymbol(masterSymbol, masterSymbol);
-      g_lastSymbolMapping = masterSymbol + " -> " + masterSymbol + " (exact)";
-      return masterSymbol;
-   }
-
-   string candidates[];
-   if(g_settings.autoDetectSymbol)
-   {
-      string masterBase = NormalizeSymbolBase(masterSymbol);
-      int total = SymbolsTotal(false);
-
-      for(int index = 0; index < total; index++)
-      {
-         string candidate = SymbolName(index, false);
-         if(StringLen(candidate) == 0 ||
-            NormalizeSymbolBase(candidate) != masterBase)
-            continue;
-
-         int size = ArraySize(candidates);
-         ArrayResize(candidates, size + 1);
-         candidates[size] = candidate;
-      }
-   }
-
-   if(ArraySize(candidates) == 1 && SymbolSelect(candidates[0], true))
-   {
-      CacheFollowerSymbol(masterSymbol, candidates[0]);
-      g_lastSymbolMapping = masterSymbol + " -> " + candidates[0] + " (auto)";
-      PrintFormat("CopyTradeFollower: auto-mapped %s -> %s (base=%s)",
-         masterSymbol, candidates[0], NormalizeSymbolBase(masterSymbol));
-      return candidates[0];
-   }
-
-   // Explicit mapping is the safe fallback when normalization cannot produce
-   // one unique server symbol.
-   string manual = ResolveManualSymbol(masterSymbol);
-   if(StringLen(manual) > 0)
-   {
-      if(ArraySize(candidates) > 1)
-         PrintFormat("CopyTradeFollower: ambiguous symbols for %s: [%s]; using manual mapping %s",
-            masterSymbol, JoinSymbolCandidates(candidates), manual);
-      return manual;
-   }
-
-   if(ArraySize(candidates) > 1)
-   {
-      g_lastSymbolMapping = "AMBIGUOUS: " + masterSymbol;
-      SetFollowerDashboardError("Symbol mapping required");
-      PrintFormat("CopyTradeFollower: ambiguous symbols for %s: [%s]. Add a symbol mapping in the dashboard.",
-         masterSymbol, JoinSymbolCandidates(candidates));
-      return "";
-   }
-
-   g_lastSymbolMapping = "UNMAPPED: " + masterSymbol;
-   SetFollowerDashboardError("Unable to map " + masterSymbol);
-   PrintFormat("CopyTradeFollower: unable to map master symbol %s (base=%s)",
-      masterSymbol, NormalizeSymbolBase(masterSymbol));
-   return "";
+   int size = ArraySize(g_loggedMessages);
+   ArrayResize(g_loggedMessages, size + 1);
+   g_loggedMessages[size] = message;
+   Print(message);
 }
 
 int VolumeDigits(const double step)
@@ -1318,10 +1244,10 @@ int VolumeDigits(const double step)
 
 double StepLotMultiplier(const int sequenceNumber)
 {
-   double multiplier = g_settings.stepStartMultiplier +
-      (sequenceNumber - 1) * g_settings.stepMultiplier;
-   return MathMax(g_settings.stepMinMultiplier,
-      MathMin(multiplier, g_settings.stepMaxMultiplier));
+   double multiplier = StepStartMultiplier +
+      (sequenceNumber - 1) * StepMultiplier;
+   return MathMax(StepMinMultiplier,
+      MathMin(multiplier, StepMaxMultiplier));
 }
 
 double NormalizeFollowerVolume(const string symbol,
@@ -1329,11 +1255,11 @@ double NormalizeFollowerVolume(const string symbol,
                                const int sequenceNumber)
 {
    double requested = masterVolume;
-   if(g_settings.lotMode == FIXED)
-      requested = g_settings.fixedLot;
-   else if(g_settings.lotMode == MULTIPLIER)
-      requested = masterVolume * g_settings.lotMultiplier;
-   else if(g_settings.lotMode == STEP_LOT)
+   if(LotMode == FIXED)
+      requested = FixedLot;
+   else if(LotMode == MULTIPLIER)
+      requested = masterVolume * LotMultiplier;
+   else if(LotMode == STEP_LOT)
       requested = masterVolume * StepLotMultiplier(sequenceNumber);
 
    double minimum = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MIN);
@@ -1344,8 +1270,8 @@ double NormalizeFollowerVolume(const string symbol,
       return 0.0;
 
    double allowedMaximum = maximum;
-   if(g_settings.maxLot > 0.0)
-      allowedMaximum = MathMin(allowedMaximum, g_settings.maxLot);
+   if(MaxLot > 0.0)
+      allowedMaximum = MathMin(allowedMaximum, MaxLot);
    if(allowedMaximum < minimum)
       return 0.0;
 
@@ -1479,9 +1405,14 @@ bool OpenCopiedPosition(const MasterPosition &master,
       return false;
    }
 
-   string symbol = ResolveFollowerSymbol(master.symbol);
-   if(StringLen(symbol) == 0)
+   // Copies open on this chart's symbol (e.g. master XAUUSD -> XAUUSDs here)
+   string symbol = _Symbol;
+   if(!IsSameInstrument(master.symbol))
+   {
+      PrintOnce(StringFormat("CopyTradeFollower: ignoring master %s trades; this EA copies %s only.",
+         master.symbol, symbol));
       return false;
+   }
 
    MqlTick tick;
    if(!SymbolInfoTick(symbol, tick) || tick.ask <= 0.0 || tick.bid <= 0.0)
@@ -1531,7 +1462,7 @@ bool OpenCopiedPosition(const MasterPosition &master,
       return false;
    }
 
-   if(g_settings.lotMode == STEP_LOT)
+   if(LotMode == STEP_LOT)
       PrintFormat("Copy AiO: step lot master=%s sequence=%d masterLot=%.8f multiplier=%.8f followerLot=%.8f",
          master.ticket, sequenceNumber, master.volume,
          StepLotMultiplier(sequenceNumber), volume);
@@ -1842,39 +1773,41 @@ void ProcessCommands(const string &commands[])
 
 int OnInit()
 {
-   g_apiBaseUrl = Trim(ApiBaseUrl);
-   while(StringLen(g_apiBaseUrl) > 0 && EndsWith(g_apiBaseUrl, "/"))
-      g_apiBaseUrl = StringSubstr(g_apiBaseUrl, 0, StringLen(g_apiBaseUrl) - 1);
-
-   if(StringLen(g_apiBaseUrl) == 0)
+   if(!MathIsValidNumber(FixedLot) || FixedLot <= 0.0 ||
+      !MathIsValidNumber(LotMultiplier) || LotMultiplier <= 0.0 ||
+      !MathIsValidNumber(MaxLot) || MaxLot <= 0.0 ||
+      !MathIsValidNumber(StepStartMultiplier) || StepStartMultiplier <= 0.0 ||
+      !MathIsValidNumber(StepMultiplier) ||
+      !MathIsValidNumber(StepMinMultiplier) || StepMinMultiplier <= 0.0 ||
+      !MathIsValidNumber(StepMaxMultiplier) || StepMaxMultiplier <= 0.0 ||
+      StepMinMultiplier > StepMaxMultiplier)
    {
-      Print("CopyTradeFollower: ApiBaseUrl cannot be empty.");
+      Print("CopyTradeFollower: invalid lot size inputs. Lots and multipliers must be above 0, and the step lowest multiplier must not exceed the highest.");
       return INIT_PARAMETERS_INCORRECT;
    }
 
-   if(MagicNumber == 0)
+   if(LotMode == FIXED && FixedLot > MaxLot)
    {
-      Print("CopyTradeFollower: MagicNumber must be greater than zero.");
+      Print("CopyTradeFollower: Fixed lot must not be greater than Max lot per copied trade.");
       return INIT_PARAMETERS_INCORRECT;
    }
 
-   g_syncIntervalMs = SyncIntervalMs > 0 ? SyncIntervalMs : 250;
-   g_trade.SetExpertMagicNumber(MagicNumber);
+   g_trade.SetExpertMagicNumber(COPY_MAGIC_NUMBER);
    g_trade.SetAsyncMode(false);
    RebuildMasterTicketMapping();
 
    ResetLastError();
-   if(!EventSetMillisecondTimer(g_syncIntervalMs))
+   if(!EventSetMillisecondTimer(SYNC_INTERVAL_MS))
    {
       PrintFormat("CopyTradeFollower: failed to start timer. interval=%d error=%d",
-         g_syncIntervalMs, GetLastError());
+         SYNC_INTERVAL_MS, GetLastError());
       return INIT_FAILED;
    }
 
    PrintFormat("CopyTradeFollower started. enabled=%s api=%s interval=%dms mapped=%d",
       Enabled ? "true" : "false",
-      g_apiBaseUrl,
-      g_syncIntervalMs,
+      API_BASE_URL,
+      SYNC_INTERVAL_MS,
       ArraySize(g_mappedMasterTickets));
    CreateFollowerDashboard();
    UpdateFollowerDashboard();

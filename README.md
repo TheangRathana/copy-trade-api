@@ -53,10 +53,32 @@ Only requests from `127.0.0.1` / `::1` are accepted. Set `EA_ALLOWED_IPS`
 
 | Method | Path | Purpose |
 |---|---|---|
-| POST | `/api/master/state` | Master EA posts its positions |
-| GET | `/api/master/state` | Latest master state |
+| POST | `/api/master/state` | Master EA posts its positions (registered masters only) |
 | POST | `/api/follower/sync` | Follower EA reports status; gets master state, settings, pending commands and its pairing code |
 | POST | `/api/follower/commands/:id/ack` | Follower EA reports a command result (`done` / `failed`) |
+
+### Admin endpoints (masters and followers)
+
+Set `ADMIN_API_KEY` in the API's environment and send it as
+`Authorization: Bearer <ADMIN_API_KEY>`. Without the variable the admin API is
+off (503). Each follower copies exactly one master; a master only posts state
+once it is registered, and an unregistered follower copies nothing.
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/api/admin/masters` | All masters, with online status and follower count |
+| POST | `/api/admin/masters` | `{ accountNumber, name, note?, enabled? }` Add a master |
+| GET | `/api/admin/masters/:account` | One master and its followers |
+| PATCH | `/api/admin/masters/:account` | `{ name?, note?, enabled? }` `enabled: false` stops copying it |
+| DELETE | `/api/admin/masters/:account` | Only when it has no followers |
+| GET | `/api/admin/followers?masterAccount=` | All followers, or one master's |
+| POST | `/api/admin/followers` | `{ accountNumber, masterAccount, name, note? }` Add a follower |
+| GET | `/api/admin/followers/:account` | One follower, with its settings and status |
+| PATCH | `/api/admin/followers/:account` | `{ masterAccount?, name?, note? }` Move it to another master |
+| DELETE | `/api/admin/followers/:account` | Also removes its settings and logs out its sessions |
+
+Masters and followers are saved in `DATA_DIR/accounts.json` until Redis is
+connected (implement `AccountRepository` in `src/modules/accounts/accounts.types.ts`).
 
 ### UI endpoints
 
@@ -83,12 +105,23 @@ they survive a restart. Master state, follower status and commands are in memory
 
 ## Follower EA (`mt5/Copy AiO.mq5`)
 
-The EA now has only three inputs: `ApiBaseUrl` (default `http://127.0.0.1:4000`),
-`SyncIntervalMs` and `Enabled`. Copy and risk settings come from the API and are
-changed in the web dashboard. Add `ApiBaseUrl` to MT5's WebRequest allowlist
-(Tools → Options → Expert Advisors).
+The EA has one input, `Enabled`. The API address (`http://127.0.0.1:4000`),
+sync interval (250 ms) and magic number (26090201) are fixed in the code. Copy
+and risk settings come from the API and are changed in the web dashboard. Add
+`http://127.0.0.1:4000` to MT5's WebRequest allowlist (Tools → Options →
+Expert Advisors).
 
-- The chart panel shows the 6-digit **Dashboard Code** used to log in.
+- **Symbol = the chart's symbol.** Attach the Master EA to the XAUUSD chart: it
+  only sends XAUUSD positions. Attach each follower to its broker's gold chart
+  (XAUUSD, XAUUSDs, XAUUSD.pro …): copies open on that chart's symbol, so no
+  symbol mapping is needed. Master trades on a different instrument are ignored.
+- The chart panel shows the 6-digit **Dashboard Code** used to log in, and the
+  risk settings in use: lot size, BUY/SELL/SL/TP, max positions and daily loss.
+- **Fast copying.** The Master EA sends the moment a trade opens, closes or its
+  SL/TP changes (`OnTradeTransaction`). The follower's sync is long-polled: when
+  it is up to date the API holds the request for up to 1.5 s and answers as soon
+  as the master's positions, its settings or a dashboard command change, so a
+  master trade reaches the follower within a few milliseconds.
 - When copying is off, no new trades open; copied trades still follow the master's closes and SL/TP.
 - A copied trade closed from the dashboard is not copied again while the master position stays open.
 - `Enabled = false` keeps the EA reporting to the dashboard but stops all trading and commands.

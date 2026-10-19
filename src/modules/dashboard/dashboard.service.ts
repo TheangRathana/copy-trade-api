@@ -1,9 +1,11 @@
 import type { z } from "zod";
 import { config } from "../../config.js";
+import type { ChangeFeed } from "../../lib/change-feed.js";
 import type { Command, CommandStore } from "../../stores/command.store.js";
 import type { FollowerStore } from "../../stores/follower.store.js";
 import type { MasterStateStore } from "../../stores/master-state.store.js";
 import type { SettingsStore } from "../../stores/settings.store.js";
+import type { AccountRepository } from "../accounts/accounts.types.js";
 import { copySettingsSchema } from "../settings/settings.schema.js";
 import type { CopySettingsPatch } from "../settings/settings.types.js";
 import type { createCommandSchema } from "./dashboard.schema.js";
@@ -13,6 +15,8 @@ export interface DashboardStores {
   followerStore: FollowerStore;
   settingsStore: SettingsStore;
   commandStore: CommandStore;
+  accountRepository: AccountRepository;
+  changeFeed: ChangeFeed;
 }
 
 type CreateCommandInput = z.infer<typeof createCommandSchema>;
@@ -25,11 +29,13 @@ export type CreateCommandResult =
 export class DashboardService {
   constructor(private readonly stores: DashboardStores) {}
 
-  getAccount(account: string) {
-    const { masterStore, followerStore, settingsStore } = this.stores;
+  async getAccount(account: string) {
+    const { masterStore, followerStore, settingsStore, accountRepository } = this.stores;
     const follower = followerStore.get(account);
     const record = settingsStore.getOrCreate(account);
-    const masterReceivedAt = masterStore.getReceivedAt();
+    const assignment = await accountRepository.getFollower(account);
+    const master = assignment ? await accountRepository.getMaster(assignment.masterAccount) : null;
+    const masterReceivedAt = master ? masterStore.getReceivedAt(master.accountNumber) : null;
     const appliedSettingsVersion = follower?.appliedSettingsVersion ?? 0;
 
     return {
@@ -48,7 +54,11 @@ export class DashboardService {
               balance: follower.balance,
               equity: follower.equity,
             },
+      // The master this account copies; null when it has none yet
       master: {
+        account: master?.accountNumber ?? null,
+        name: master?.name ?? null,
+        enabled: master?.enabled ?? false,
         online:
           masterReceivedAt !== null &&
           Date.now() - masterReceivedAt <= config.masterOnlineMs,
@@ -58,6 +68,8 @@ export class DashboardService {
         stopReason: record.stopReason,
       },
       settings: record.settings,
+      // Set in the EA's MT5 inputs; null until an EA that reports it syncs
+      lotSettings: follower?.lotSettings ?? null,
       settingsVersion: record.version,
       appliedSettingsVersion,
       settingsApplied: appliedSettingsVersion >= record.version,
@@ -65,7 +77,7 @@ export class DashboardService {
     };
   }
 
-  updateSettings(account: string, patch: CopySettingsPatch) {
+  async updateSettings(account: string, patch: CopySettingsPatch) {
     const record = this.stores.settingsStore.getOrCreate(account);
     const result = copySettingsSchema.safeParse({ ...record.settings, ...patch });
 
@@ -74,10 +86,11 @@ export class DashboardService {
     }
 
     this.stores.settingsStore.update(account, { settings: result.data });
-    return { success: true as const, data: this.getAccount(account) };
+    this.stores.changeFeed.notifyAccount(account);
+    return { success: true as const, data: await this.getAccount(account) };
   }
 
-  startCopy(account: string) {
+  async startCopy(account: string) {
     const record = this.stores.settingsStore.getOrCreate(account);
 
     if (!record.copyEnabled) {
@@ -85,12 +98,13 @@ export class DashboardService {
         copyEnabled: true,
         stopReason: null,
       });
+      this.stores.changeFeed.notifyAccount(account);
     }
 
-    return this.getAccount(account);
+    return await this.getAccount(account);
   }
 
-  stopCopy(account: string, closeAll: boolean) {
+  async stopCopy(account: string, closeAll: boolean) {
     const record = this.stores.settingsStore.getOrCreate(account);
 
     if (record.copyEnabled) {
@@ -104,7 +118,8 @@ export class DashboardService {
       ? this.stores.commandStore.create(account, "CLOSE_ALL", null)
       : null;
 
-    return { ...this.getAccount(account), command };
+    this.stores.changeFeed.notifyAccount(account);
+    return { ...(await this.getAccount(account)), command };
   }
 
   createCommand(account: string, input: CreateCommandInput): CreateCommandResult {
@@ -120,20 +135,21 @@ export class DashboardService {
         return { status: "position_not_found" };
       }
 
-      return {
-        status: "ok",
-        command: this.stores.commandStore.create(
-          account,
-          "CLOSE_POSITION",
-          input.ticket,
-        ),
-      };
+      return this.queueCommand(account, "CLOSE_POSITION", input.ticket);
     }
 
-    return {
-      status: "ok",
-      command: this.stores.commandStore.create(account, "CLOSE_ALL", null),
-    };
+    return this.queueCommand(account, "CLOSE_ALL", null);
+  }
+
+  // Wakes the follower's waiting sync so the command runs right away
+  private queueCommand(
+    account: string,
+    type: Command["type"],
+    ticket: string | null,
+  ): CreateCommandResult {
+    const command = this.stores.commandStore.create(account, type, ticket);
+    this.stores.changeFeed.notifyAccount(account);
+    return { status: "ok", command };
   }
 
   getCommand(account: string, id: string): Command | null {

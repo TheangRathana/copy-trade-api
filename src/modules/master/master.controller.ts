@@ -20,24 +20,24 @@ export class MasterController {
       return;
     }
 
-    const state = this.service.updateState(result.data);
-    await reply.status(201).send({ success: true, data: state });
-  };
+    const update = await this.service.updateState(result.data);
 
-  getState = async (
-    _request: FastifyRequest,
-    reply: FastifyReply,
-  ): Promise<void> => {
-    const state = this.service.getLatestState();
-
-    if (state === null) {
+    if (update.status === "not_registered") {
       await reply.status(404).send({
         success: false,
-        error: "Master state not found",
+        error: `Master ${result.data.accountNumber} is not registered. Add it with POST /api/admin/masters.`,
       });
       return;
     }
 
-    await reply.send({ success: true, data: state });
+    if (update.status === "disabled") {
+      await reply.status(403).send({
+        success: false,
+        error: `Master ${result.data.accountNumber} is disabled`,
+      });
+      return;
+    }
+
+    await reply.status(201).send({ success: true, data: update.state });
   };
 }
